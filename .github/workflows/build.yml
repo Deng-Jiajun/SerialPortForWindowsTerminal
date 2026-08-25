@@ -1,0 +1,94 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BOOST_VERSION: 1_68_0
+  BOOST_ARCHIVE_SHA256: 3b1db0b67079266c40b98329d85916e910bbadfc3db3e860c049056788d4d5cd
+  BOOST_ROOT: ${{ github.workspace }}\..\boost_1_68_0
+
+jobs:
+  build:
+    name: ${{ matrix.configuration }} ${{ matrix.platform }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        configuration:
+          - Debug
+          - Release
+        platform:
+          - x86
+          - x64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Cache Boost
+        id: boost-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.BOOST_ROOT }}
+          key: boost-${{ runner.os }}-${{ env.BOOST_VERSION }}
+
+      - name: Download Boost
+        if: steps.boost-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "boost_$env:BOOST_VERSION.zip"
+          $uri = "https://archives.boost.io/release/1.68.0/source/boost_$env:BOOST_VERSION.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+
+          $actualHash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:BOOST_ARCHIVE_SHA256) {
+              throw "Boost archive SHA256 mismatch: $actualHash"
+          }
+
+          Expand-Archive -Path $archive -DestinationPath (Split-Path -Parent $env:BOOST_ROOT)
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build solution
+        shell: pwsh
+        run: >-
+          msbuild SerialForWindowsTerminal.sln
+          /m
+          /t:Rebuild
+          /p:Configuration=${{ matrix.configuration }}
+          /p:Platform=${{ matrix.platform }}
+          /p:BoostRoot="$env:BOOST_ROOT"
+          /verbosity:minimal
+
+      - name: Stage release binaries
+        if: matrix.configuration == 'Release'
+        shell: pwsh
+        run: |
+          if ("${{ matrix.platform }}" -eq "x64") {
+              $sourceDirectory = "x64\Release"
+          } else {
+              $sourceDirectory = "Release"
+          }
+
+          $artifactDirectory = "artifacts\SerialPortForWindowsTerminal-${{ matrix.platform }}"
+          New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+          Copy-Item -Path "$sourceDirectory\SerialForWindowsTerminal.exe" -Destination $artifactDirectory
+          Copy-Item -Path "$sourceDirectory\SerialTerminalCtl.exe" -Destination $artifactDirectory
+
+      - name: Upload release binaries
+        if: matrix.configuration == 'Release'
+        uses: actions/upload-artifact@v7
+        with:
+          name: SerialPortForWindowsTerminal-${{ matrix.platform }}
+          path: artifacts/SerialPortForWindowsTerminal-${{ matrix.platform }}
+          if-no-files-found: error
+          retention-days: 14

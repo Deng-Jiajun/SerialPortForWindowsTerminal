@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BOOST_VERSION: 1_68_0
+  BOOST_ARCHIVE_SHA256: 3b1db0b67079266c40b98329d85916e910bbadfc3db3e860c049056788d4d5cd
+  BOOST_ROOT: ${{ github.workspace }}\..\boost_1_68_0
+
+jobs:
+  release:
+    name: Build and publish ${{ github.ref_name }}
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v7
+
+      - name: Cache Boost
+        id: boost-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.BOOST_ROOT }}
+          key: boost-${{ runner.os }}-${{ env.BOOST_VERSION }}
+
+      - name: Download Boost
+        if: steps.boost-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "boost_$env:BOOST_VERSION.zip"
+          $uri = "https://archives.boost.io/release/1.68.0/source/boost_$env:BOOST_VERSION.zip"
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+
+          $actualHash = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:BOOST_ARCHIVE_SHA256) {
+              throw "Boost archive SHA256 mismatch: $actualHash"
+          }
+
+          Expand-Archive -Path $archive -DestinationPath (Split-Path -Parent $env:BOOST_ROOT)
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      - name: Build x86 release
+        shell: pwsh
+        run: >-
+          msbuild SerialForWindowsTerminal.sln
+          /m
+          /t:Rebuild
+          /p:Configuration=Release
+          /p:Platform=x86
+          /p:BoostRoot="$env:BOOST_ROOT"
+          /verbosity:minimal
+
+      - name: Build x64 release
+        shell: pwsh
+        run: >-
+          msbuild SerialForWindowsTerminal.sln
+          /m
+          /t:Rebuild
+          /p:Configuration=Release
+          /p:Platform=x64
+          /p:BoostRoot="$env:BOOST_ROOT"
+          /verbosity:minimal
+
+      - name: Package release binaries
+        shell: pwsh
+        run: |
+          $distDirectory = Join-Path $PWD "dist"
+          New-Item -ItemType Directory -Path $distDirectory -Force | Out-Null
+
+          $packages = @(
+              @{ Architecture = "x86"; Source = "Release" },
+              @{ Architecture = "x64"; Source = "x64\Release" }
+          )
+
+          foreach ($package in $packages) {
+              $packageName = "SerialPortForWindowsTerminal-$env:GITHUB_REF_NAME-$($package.Architecture)"
+              $stagingDirectory = Join-Path $env:RUNNER_TEMP $packageName
+              New-Item -ItemType Directory -Path $stagingDirectory -Force | Out-Null
+
+              Copy-Item -Path "$($package.Source)\SerialForWindowsTerminal.exe" -Destination $stagingDirectory
+              Copy-Item -Path "$($package.Source)\SerialTerminalCtl.exe" -Destination $stagingDirectory
+              Copy-Item -Path "README.md" -Destination $stagingDirectory
+              Copy-Item -Path "LICENSE" -Destination $stagingDirectory
+
+              $archivePath = Join-Path $distDirectory "$packageName.zip"
+              Compress-Archive -Path "$stagingDirectory\*" -DestinationPath $archivePath
+          }
+
+          $checksumLines = Get-ChildItem -Path $distDirectory -Filter "*.zip" |
+              Sort-Object Name |
+              ForEach-Object {
+                  $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+                  "$hash  $($_.Name)"
+              }
+          Set-Content -Path (Join-Path $distDirectory "SHA256SUMS.txt") -Value $checksumLines -Encoding ascii
+
+      - name: Upload packaged binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: SerialPortForWindowsTerminal-${{ github.ref_name }}
+          path: dist
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $assets = Get-ChildItem -Path "dist" -File | ForEach-Object { $_.FullName }
+          gh release create $env:GITHUB_REF_NAME $assets `
+              --verify-tag `
+              --title "SerialPortForWindowsTerminal $env:GITHUB_REF_NAME" `
+              --generate-notes
