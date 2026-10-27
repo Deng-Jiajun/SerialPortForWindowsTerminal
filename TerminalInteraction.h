@@ -28,6 +28,21 @@ class COMMAND_HISTORY
     std::vector<std::wstring> Unsaved;
 };
 
+// 只匹配发送后的第一行；失配时归还暂存前缀，不搜索后续日志
+class COMMAND_ECHO_FILTER
+{
+  public:
+    void Expect(const std::vector<uint8_t> &command);
+    std::vector<uint8_t> Feed(const uint8_t *&data, size_t &size);
+    std::vector<uint8_t> Flush();
+    bool Waiting() const { return !Expected.empty() || SkipLF; }
+
+  private:
+    std::vector<uint8_t> Expected;
+    size_t Matched = 0;
+    bool SkipLF = false;
+};
+
 // 在插入显示用转义序列前，先收齐串口中被分包的字符和 ANSI 序列
 class RECEIVE_FORMATTER
 {

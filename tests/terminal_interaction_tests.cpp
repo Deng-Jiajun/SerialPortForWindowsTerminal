@@ -33,6 +33,61 @@ static std::string Bytes(const std::wstring& text, UINT codePage = CP_UTF8)
     return std::string(bytes.begin(), bytes.end());
 }
 
+static std::string FilterEcho(COMMAND_ECHO_FILTER& filter, const std::string& input)
+{
+    auto data = reinterpret_cast<const uint8_t*>(input.data());
+    auto size = input.size();
+    auto pending = filter.Feed(data, size);
+    std::string output(pending.begin(), pending.end());
+    output.append(reinterpret_cast<const char*>(data), size);
+    return output;
+}
+
+static void TestEchoFilter()
+{
+    const std::string sample = "pwd\r\n/customer/zctrl\r\npwd\r\n/customer/zctrl # ";
+    const std::string expected = "/customer/zctrl\r\npwd\r\n/customer/zctrl # ";
+    for (size_t split = 0; split <= sample.size(); ++split)
+    {
+        COMMAND_ECHO_FILTER filter;
+        filter.Expect({'p', 'w', 'd'});
+        auto output = FilterEcho(filter, sample.substr(0, split));
+        output += FilterEcho(filter, sample.substr(split));
+        Check(output == expected, "hide only first complete echo at every packet boundary");
+    }
+    COMMAND_ECHO_FILTER filter;
+    Check(FilterEcho(filter, sample) == sample, "unarmed filter preserves all received bytes");
+    for (auto ending : {"\r", "\n", "\r\n"})
+    {
+        filter.Expect({'p', 'w', 'd'});
+        Check(FilterEcho(filter, std::string("pwd") + ending + "/\r\n") == "/\r\n", "hide echo with CR LF or CRLF");
+    }
+    filter.Expect({'p', 'w', 'd'});
+    Check(FilterEcho(filter, "pw").empty(), "hold only a matching prefix");
+    Check(FilterEcho(filter, "X\r\npwd\r\n") == "pwX\r\npwd\r\n", "mismatch restores prefix and does not filter later equal lines");
+    filter.Expect({'p', 'w', 'd'});
+    Check(FilterEcho(filter, "pwd: error\r\n") == "pwd: error\r\n", "command prefix in real output is not an echo");
+    filter.Expect({'p', 'w', 'd'});
+    Check(FilterEcho(filter, "pw\r\n") == "pw\r\n", "shorter received line is preserved");
+    filter.Expect({'p', 'w', 'd'});
+    FilterEcho(filter, "pw");
+    auto pending = filter.Flush();
+    Check(std::string(pending.begin(), pending.end()) == "pw" && !filter.Waiting(), "flush restores unfinished echo and disarms filter");
+    Check(FilterEcho(filter, "d\r\n") == "d\r\n", "late echo after flush is not suppressed");
+    filter.Expect({});
+    Check(FilterEcho(filter, "\r\n") == "\r\n", "empty command does not remove received blank lines");
+    for (auto codePage : {static_cast<UINT>(CP_UTF8), 936u})
+    {
+        auto command = EncodeTerminalText(L"echo 中文", codePage);
+        filter.Expect(command);
+        std::string output;
+        for (auto byte : command) output += FilterEcho(filter, std::string(1, static_cast<char>(byte)));
+        output += FilterEcho(filter, "\r");
+        output += FilterEcho(filter, "\n" + Bytes(L"中文", codePage) + "\r\n");
+        Check(output == Bytes(L"中文", codePage) + "\r\n", "UTF-8 and GBK echoes match across individual bytes");
+    }
+}
+
 static void TestReceive()
 {
     const std::string sample = "\033[31m温度 ERROR\033[0m\r\nnext\n\nlast";
@@ -231,6 +286,44 @@ static void TestLocalSubmission(const std::wstring& historyPath, const std::stri
     Check(sent == expected, name);
 }
 
+static void TestEchoDisplay(bool local, bool external, bool timeout)
+{
+    TEST_BYTE_PIPE outputPipe;
+    boost::asio::io_service io;
+    boost::asio::windows::stream_handle output(io, outputPipe.TakeServer());
+    CONSOLE_WRITE_QUEUE queue(output);
+    SERIAL_CONFIG cfg = {};
+    cfg.EchoMode = local ? 1 : 0;
+    cfg.Timestamps = 1;
+    COMMAND_HISTORY history;
+    LOCAL_LINE_EDITOR editor(history);
+    TERMINAL_DISPLAY display(io, queue, cfg, editor);
+    display.Sent({'p', 'w', 'd'}, external);
+    const std::string prefix = "pw";
+    display.Receive(reinterpret_cast<const uint8_t*>(prefix.data()), prefix.size(), "[first] ");
+    if (timeout)
+    {
+        io.run_for(std::chrono::milliseconds(1100));
+        io.restart();
+    }
+    const std::string rest = "d\r\n/\r\npwd\r\n/ # ";
+    display.Receive(reinterpret_cast<const uint8_t*>(rest.data()), rest.size(), "[later] ");
+    io.run_for(std::chrono::milliseconds(100));
+    DWORD available = 0, read = 0;
+    if (!PeekNamedPipe(outputPipe.Client, nullptr, 0, nullptr, &available, nullptr))
+        throw std::runtime_error("cannot inspect echo display output");
+    std::string text(available, '\0');
+    if (available) ReadFile(outputPipe.Client, &text[0], available, &read, nullptr);
+    text.resize(read);
+    Check(text.find(external ? "\033[96m[TX External] > pwd" : "\033[96m> pwd") != std::string::npos,
+          "blue timestamped transmission record is retained");
+    const bool suppressed = local && !external && !timeout;
+    Check((text.find("[first] pwd\r\n") == std::string::npos) == suppressed,
+          "echo display filtering applies only to timely local manual input");
+    Check(text.find("[later] /\r\n[later] pwd\r\n[later] / # ") != std::string::npos,
+          "result later equal line prompt and receive timestamps are retained");
+}
+
 static void TestErrorEncoding()
 {
     wchar_t systemMessage[1024] = {};
@@ -349,6 +442,8 @@ static int Preview(const std::wstring& path)
     Type(editor, "ma");
     display.Redraw();
     auto send = [&](const std::string& data) { display.Receive(reinterpret_cast<const uint8_t*>(data.data()), data.size(), LocalTimestamp()); };
+    display.Sent(EncodeTerminalText(L"pwd", CP_UTF8), false);
+    send("pwd\r\n/customer/zctrl\r\n/customer/zctrl # ");
     send("[DEBUG] connected to test device\r\n");
     send("[WARN] reconnecting\r\n");
     send("[ERROR] connection timed out\r\n");
@@ -384,12 +479,17 @@ int wmain(int argc, const wchar_t* argv[])
         DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_SETTING_DIALOG), GetForegroundWindow(), SettingFunc, 1);
         return 0;
     }
+    TestEchoFilter();
     TestReceive();
     TestHistoryAndInput(argv[1]);
     auto submissionHistory = std::wstring(argv[1]) + L".submission";
     TestLocalSubmission(submissionHistory, "echo hi\r", "echo hi\r", "Enter writes one CR without an extra blank submission");
     TestLocalSubmission(submissionHistory, "echo hi\r\n", "echo hi\r", "CRLF console input submits the command only once");
     TestLocalSubmission(submissionHistory, "\r", "\r", "empty Enter writes one CR");
+    TestEchoDisplay(true, false, false);
+    TestEchoDisplay(false, false, false);
+    TestEchoDisplay(true, true, false);
+    TestEchoDisplay(true, false, true);
     TestErrorEncoding();
     TestSerialTermination(false, false);
     TestSerialTermination(true, false);

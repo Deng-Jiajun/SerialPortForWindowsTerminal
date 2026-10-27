@@ -89,6 +89,8 @@ jobs:
               Copy-Item -Path "$($package.Source)\SerialTerminalCtl.exe" -Destination $stagingDirectory
               Copy-Item -Path "README.md" -Destination $stagingDirectory
               Copy-Item -Path "LICENSE" -Destination $stagingDirectory
+              New-Item -ItemType Directory -Path "$stagingDirectory\images" -Force | Out-Null
+              Copy-Item -Path "images\settings.png" -Destination "$stagingDirectory\images"
 
               $archivePath = Join-Path $distDirectory "$packageName.zip"
               Compress-Archive -Path "$stagingDirectory\*" -DestinationPath $archivePath

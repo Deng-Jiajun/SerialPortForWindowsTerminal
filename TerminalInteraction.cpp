@@ -211,6 +211,57 @@ DWORD COMMAND_HISTORY::Remember(const std::wstring &command)
     return error;
 }
 
+void COMMAND_ECHO_FILTER::Expect(const std::vector<uint8_t> &command)
+{
+    Expected = command;
+    Matched = 0;
+    SkipLF = false;
+}
+
+std::vector<uint8_t> COMMAND_ECHO_FILTER::Flush()
+{
+    std::vector<uint8_t> output(Expected.begin(), Expected.begin() + Matched);
+    Expected.clear();
+    Matched = 0;
+    SkipLF = false;
+    return output;
+}
+
+std::vector<uint8_t> COMMAND_ECHO_FILTER::Feed(const uint8_t *&data, size_t &size)
+{
+    while (size)
+    {
+        if (SkipLF)
+        {
+            SkipLF = false;
+            if (*data == '\n')
+            {
+                ++data;
+                --size;
+            }
+        }
+        if (Expected.empty())
+            break;
+        if (Matched == Expected.size())
+        {
+            if (*data != '\r' && *data != '\n')
+                return Flush();
+            SkipLF = *data == '\r';
+            Expected.clear();
+            Matched = 0;
+        }
+        else
+        {
+            if (*data != Expected[Matched])
+                return Flush();
+            ++Matched;
+        }
+        ++data;
+        --size;
+    }
+    return {};
+}
+
 static size_t EncodedCharacterSize(uint8_t byte, UINT codePage)
 {
     if (codePage != CP_UTF8)

@@ -706,7 +706,7 @@ class TERMINAL_DISPLAY
   public:
     TERMINAL_DISPLAY(boost::asio::io_service &ioctx, CONSOLE_WRITE_QUEUE &queue, SERIAL_CONFIG &config,
                      LOCAL_LINE_EDITOR &editor)
-        : IoContext(ioctx), Queue(queue), Config(config), Editor(editor), ResizeTimer(ioctx)
+        : IoContext(ioctx), Queue(queue), Config(config), Editor(editor), ResizeTimer(ioctx), EchoTimer(ioctx)
     {
         ResetHighlightOutputState(Highlight, config);
     }
@@ -729,6 +729,7 @@ class TERMINAL_DISPLAY
 
     void Configure(SERIAL_CONFIG next)
     {
+        FlushEcho();
         auto pending = Formatter.Flush();
         auto output = BuildHighlightedOutput(Highlight, pending.data(), pending.size(), true);
         Write(std::move(output));
@@ -750,16 +751,23 @@ class TERMINAL_DISPLAY
 
     void Receive(const uint8_t *data, size_t size, const std::string &time)
     {
-        std::vector<uint8_t> bytes;
-        if (Config.Timestamps || Local)
-            bytes = Formatter.Feed(data, size, time, Config.Timestamps != 0, Local, CodePage());
+        auto firstTime = EchoTime.empty() ? time : EchoTime;
+        auto pending = Echo.Feed(data, size);
+        ReceiveBytes(pending.data(), pending.size(), firstTime);
+        ReceiveBytes(data, size, time);
+        if (Echo.Waiting())
+            EchoTime = firstTime;
         else
-            bytes.assign(data, data + size);
-        Write(BuildHighlightedOutput(Highlight, bytes.data(), bytes.size(), false));
+        {
+            EchoTime.clear();
+            boost::system::error_code ignored;
+            EchoTimer.cancel(ignored);
+        }
     }
 
     void Message(const std::string &text)
     {
+        FlushEcho();
         Write(BuildHighlightedOutput(Highlight, nullptr, 0, true));
         Formatter.BeginLine();
         std::string output = "\r\n";
@@ -776,6 +784,16 @@ class TERMINAL_DISPLAY
         for (auto byte : command)
             text += byte < 32 || byte == 127 ? ' ' : static_cast<char>(byte);
         Message(text + "\033[39m");
+        if (Config.EchoMode == 1 && !external && !command.empty())
+        {
+            Echo.Expect(command);
+            // 接收内容没有回显标记；只在发送后短时间内尝试完整匹配
+            EchoTimer.expires_after(std::chrono::seconds(1));
+            EchoTimer.async_wait([this](const boost::system::error_code &ec) {
+                if (!ec)
+                    FlushEcho();
+            });
+        }
     }
 
     void Redraw()
@@ -799,6 +817,7 @@ class TERMINAL_DISPLAY
         Stopped = true;
         boost::system::error_code ignored;
         ResizeTimer.cancel(ignored);
+        EchoTimer.cancel(ignored);
     }
 
     void Stop(const boost::system::error_code& error = {})
@@ -807,6 +826,7 @@ class TERMINAL_DISPLAY
             return;
         Failure = error;
         Cancel();
+        FlushEcho();
         auto pending = Formatter.Flush();
         Write(BuildHighlightedOutput(Highlight, pending.data(), pending.size(), true));
         std::string end = Local ? EndFooter() : "";
@@ -816,6 +836,27 @@ class TERMINAL_DISPLAY
     }
 
   private:
+    void ReceiveBytes(const uint8_t *data, size_t size, const std::string &time)
+    {
+        if (!size)
+            return;
+        std::vector<uint8_t> bytes;
+        if (Config.Timestamps || Local)
+            bytes = Formatter.Feed(data, size, time, Config.Timestamps != 0, Local, CodePage());
+        else
+            bytes.assign(data, data + size);
+        Write(BuildHighlightedOutput(Highlight, bytes.data(), bytes.size(), false));
+    }
+
+    void FlushEcho()
+    {
+        boost::system::error_code ignored;
+        EchoTimer.cancel(ignored);
+        auto pending = Echo.Flush();
+        ReceiveBytes(pending.data(), pending.size(), EchoTime);
+        EchoTime.clear();
+    }
+
     void QueueText(const std::string &text)
     {
         Queue.Enqueue(std::vector<uint8_t>(text.begin(), text.end()));
@@ -885,8 +926,11 @@ class TERMINAL_DISPLAY
     SERIAL_CONFIG &Config;
     LOCAL_LINE_EDITOR &Editor;
     boost::asio::steady_timer ResizeTimer;
+    boost::asio::steady_timer EchoTimer;
     HIGHLIGHT_OUTPUT_STATE Highlight;
     RECEIVE_FORMATTER Formatter;
+    COMMAND_ECHO_FILTER Echo;
+    std::string EchoTime;
     bool Local = false;
     bool Stopped = false;
     boost::system::error_code Failure;
