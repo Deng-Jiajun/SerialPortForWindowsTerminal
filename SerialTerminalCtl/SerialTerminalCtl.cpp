@@ -25,7 +25,7 @@ static void PrintUsage()
         L"  --line-ending <type>  none, cr, lf, or crlf (default: crlf).\n"
         L"  --                    End options; the remaining text is the command.\n\n"
         L"Example:\n"
-        L"  .\\SerialTerminalCtl.exe exec --prompt \"# \" \"ls -l\"\n";
+        L"  .\\SerialTerminalCtl.exe exec --line-ending cr --prompt \"# \" \"ls -l\"\n";
 }
 
 static bool ParseDword(const wchar_t* value, DWORD& result)

@@ -4,6 +4,7 @@
 #include "framework.h"
 #include "SerialForWindowsTerminal.h"
 #include "SerialAutomationProtocol.h"
+#include "TerminalInteraction.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -30,7 +31,6 @@ INT_PTR CALLBACK    SettingFunc(HWND, UINT, WPARAM, LPARAM);
 bool g_isCtrlAPressed = false;
 // 添加全局标志来控制程序退出
 bool g_shouldExit = false;
-std::vector<uint8_t> g_lineBuffer;
 
 enum HIGHLIGHT_COLOR : DWORD
 {
@@ -172,6 +172,7 @@ typedef struct
     DWORD FlowControl;
     DWORD EncodingFormat;  // 添加编码格式字段：0=UTF8, 1=GBK
     DWORD EchoMode;        // 添加回显模式字段：0=关闭(字符模式), 1=开启(行模式)
+    DWORD Timestamps;
     std::vector<HIGHLIGHT_RULE> HighlightRules;
 }SERIAL_CONFIG;
 
@@ -266,32 +267,10 @@ static void WriteSerialConfig(const SERIAL_CONFIG& cfg)
         ::RegSetValueEx(hKey, L"FlowControl", 0, dwType, (CONST LPBYTE)&cfg.FlowControl, dwSize);
         ::RegSetValueEx(hKey, L"EncodingFormat", 0, dwType, (CONST LPBYTE)&cfg.EncodingFormat, dwSize);
         ::RegSetValueEx(hKey, L"EchoMode", 0, dwType, (CONST LPBYTE)&cfg.EchoMode, dwSize);  // 写入回显模式
+        ::RegSetValueEx(hKey, L"Timestamps", 0, dwType, (CONST LPBYTE)&cfg.Timestamps, dwSize);
         WriteHighlightRules(hKey, cfg.HighlightRules);
         ::RegCloseKey(hKey);
     }
-}
-
-static void ToggleEncodingFormat(SERIAL_CONFIG& cfg)
-{
-    // 切换编码格式
-    cfg.EncodingFormat = (cfg.EncodingFormat == 0) ? 1 : 0;
-    
-    // 应用新的编码格式
-    if (cfg.EncodingFormat == 0) // UTF-8
-    {
-        SetConsoleOutputCP(CP_UTF8);
-        SetConsoleCP(CP_UTF8);
-        std::cout << "\033[32mConsole encoding: UTF-8\033[0m" << std::endl;
-    }
-    else // GBK
-    {
-        SetConsoleOutputCP(936);
-        SetConsoleCP(936);
-        std::cout << "\033[32mConsole encoding: GBK\033[0m" << std::endl;
-    }
-    
-    // 保存配置到注册表
-    WriteSerialConfig(cfg);
 }
 
 static SERIAL_CONFIG ReadSerialConfig()
@@ -306,6 +285,7 @@ static SERIAL_CONFIG ReadSerialConfig()
     cfg.FlowControl = 0;
     cfg.EncodingFormat = 0;  // 默认使用UTF-8编码
     cfg.EchoMode = 0;        // 默认关闭回显模式（字符模式）
+    cfg.Timestamps = 1;
     cfg.HighlightRules.push_back({L"ERROR", HIGHLIGHT_COLOR_RED});
     cfg.HighlightRules.push_back({L"WARN", HIGHLIGHT_COLOR_YELLOW});
     if (ERROR_SUCCESS == ::RegOpenKeyEx(HKEY_CURRENT_USER, L"SOFTWARE\\SerialForWindowsTerminal", 0, KEY_READ, &hKey))
@@ -321,25 +301,11 @@ static SERIAL_CONFIG ReadSerialConfig()
         ::RegQueryValueEx(hKey, L"FlowControl", 0, &dwType, (LPBYTE)&cfg.FlowControl, &dwSize);
         ::RegQueryValueEx(hKey, L"EncodingFormat", 0, &dwType, (LPBYTE)&cfg.EncodingFormat, &dwSize);
         ::RegQueryValueEx(hKey, L"EchoMode", 0, &dwType, (LPBYTE)&cfg.EchoMode, &dwSize);  // 读取回显模式
+        ::RegQueryValueEx(hKey, L"Timestamps", 0, &dwType, (LPBYTE)&cfg.Timestamps, &dwSize);
         ReadHighlightRules(hKey, cfg.HighlightRules);
         ::RegCloseKey(hKey);
     }
     return cfg;
-}
-
-static void ToggleEchoMode(SERIAL_CONFIG& cfg)
-{
-    // 切换回显模式
-    cfg.EchoMode = (cfg.EchoMode == 0) ? 1 : 0;
-    
-    // 清空行缓冲区
-    g_lineBuffer.clear();
-    
-    // 显示当前回显模式
-    std::cout << "\033[32mEcho mode: " << (cfg.EchoMode == 0 ? "Off" : "On") << "\033[0m" << std::endl;
-    
-    // 保存配置到注册表
-    WriteSerialConfig(cfg);
 }
 
 static boost::system::error_code InitializeSerialPort(boost::asio::serial_port& serialPort,const SERIAL_CONFIG& cfg, boost::system::error_code& ec)
@@ -487,13 +453,6 @@ static void ResetHighlightOutputState(HIGHLIGHT_OUTPUT_STATE& state, const SERIA
         {
             return left.Keyword.size() > right.Keyword.size();
         });
-}
-
-static std::shared_ptr<HIGHLIGHT_OUTPUT_STATE> CreateHighlightOutputState(const SERIAL_CONFIG& cfg)
-{
-    auto state = std::make_shared<HIGHLIGHT_OUTPUT_STATE>();
-    ResetHighlightOutputState(*state, cfg);
-    return state;
 }
 
 static void AppendAnsiSequence(std::vector<uint8_t>& output, const char* sequence)
@@ -688,14 +647,180 @@ private:
 using SERIAL_WRITE_QUEUE = ASYNC_WRITE_QUEUE<boost::asio::serial_port>;
 using CONSOLE_WRITE_QUEUE = ASYNC_WRITE_QUEUE<boost::asio::windows::stream_handle>;
 
-static void ShowKeyboardInputIgnored(CONSOLE_WRITE_QUEUE& consoleWriteQueue)
+class TERMINAL_DISPLAY
 {
-    std::vector<uint8_t> output;
-    AppendAnsiSequence(
-        output,
-        "\a\r\n\033[93m[External] command is running; keyboard input ignored\033[39m\r\n");
-    consoleWriteQueue.Enqueue(std::move(output));
-}
+  public:
+    TERMINAL_DISPLAY(boost::asio::io_service &ioctx, CONSOLE_WRITE_QUEUE &queue, SERIAL_CONFIG &config,
+                     LOCAL_LINE_EDITOR &editor)
+        : IoContext(ioctx), Queue(queue), Config(config), Editor(editor), ResizeTimer(ioctx)
+    {
+        ResetHighlightOutputState(Highlight, config);
+    }
+
+    UINT CodePage() const
+    {
+        return Config.EncodingFormat == 0 ? CP_UTF8 : 936;
+    }
+
+    void Start()
+    {
+        ApplyMode();
+        WatchSize();
+    }
+
+    void ApplyMode()
+    {
+        Configure(Config);
+    }
+
+    void Configure(SERIAL_CONFIG next)
+    {
+        auto pending = Formatter.Flush();
+        auto output = BuildHighlightedOutput(Highlight, pending.data(), pending.size(), true);
+        Write(std::move(output));
+        if (Local)
+            QueueText(EndFooter());
+        Config = std::move(next);
+        auto codePage = CodePage();
+        Queue.Enqueue({}, [codePage]() {
+            SetConsoleOutputCP(codePage);
+            SetConsoleCP(codePage);
+            return true;
+        });
+        Local = Config.EchoMode == 1;
+        ResetHighlightOutputState(Highlight, Config);
+        Editor.ResetDecoder(codePage);
+        if (Local)
+            BeginFooter();
+    }
+
+    void Receive(const uint8_t *data, size_t size, const std::string &time)
+    {
+        std::vector<uint8_t> bytes;
+        if (Config.Timestamps || Local)
+            bytes = Formatter.Feed(data, size, time, Config.Timestamps != 0, Local, CodePage());
+        else
+            bytes.assign(data, data + size);
+        Write(BuildHighlightedOutput(Highlight, bytes.data(), bytes.size(), false));
+    }
+
+    void Message(const std::string &text)
+    {
+        Write(BuildHighlightedOutput(Highlight, nullptr, 0, true));
+        Formatter.BeginLine();
+        std::string output = "\r\n";
+        if (Config.Timestamps)
+            output += LocalTimestamp();
+        output += text + "\r\n";
+        Write(std::vector<uint8_t>(output.begin(), output.end()));
+    }
+
+    void Sent(const std::vector<uint8_t> &command, bool external)
+    {
+        std::string text = external ? "\033[96m[TX External] > " : "\033[96m> ";
+        // 发送记录只显示文本，避免外部控制命令中的控制字符改变输入区
+        for (auto byte : command)
+            text += byte < 32 || byte == 127 ? ' ' : static_cast<char>(byte);
+        Message(text + "\033[39m");
+    }
+
+    void Redraw()
+    {
+        if (Local)
+            QueueText("\033[?25l" + Editor.Render(Rows, Columns, CodePage()) + "\033[?25h");
+    }
+
+    void Stop()
+    {
+        if (Stopped)
+            return;
+        Stopped = true;
+        ResizeTimer.cancel();
+        auto pending = Formatter.Flush();
+        Write(BuildHighlightedOutput(Highlight, pending.data(), pending.size(), true));
+        std::string end = Local ? EndFooter() : "";
+        Local = false;
+        Queue.Enqueue(std::vector<uint8_t>(end.begin(), end.end()), {},
+                      [this](const boost::system::error_code &) { IoContext.stop(); });
+    }
+
+  private:
+    void QueueText(const std::string &text)
+    {
+        Queue.Enqueue(std::vector<uint8_t>(text.begin(), text.end()));
+    }
+
+    void Write(std::vector<uint8_t> output)
+    {
+        if (output.empty())
+            return;
+        if (Local)
+        {
+            std::vector<uint8_t> wrapped;
+            AppendAnsiSequence(wrapped, "\033[?25l\x1b\x38");
+            wrapped.insert(wrapped.end(), output.begin(), output.end());
+            AppendAnsiSequence(wrapped, "\x1b\x37");
+            auto input = Editor.Render(Rows, Columns, CodePage());
+            wrapped.insert(wrapped.end(), input.begin(), input.end());
+            AppendAnsiSequence(wrapped, "\033[?25h");
+            output = std::move(wrapped);
+        }
+        Queue.Enqueue(std::move(output));
+    }
+
+    std::string EndFooter() const
+    {
+        return "\033[" + std::to_string(Rows) + ";1H\033[2K\033[r\x1b\x38\033[0m\033[?2004l\033[?25h\r\n";
+    }
+
+    void BeginFooter()
+    {
+        CONSOLE_SCREEN_BUFFER_INFO info = {};
+        if (!GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info))
+        {
+            Message("[Error] Cannot read console dimensions for local input");
+            Stop();
+            return;
+        }
+        Rows = (std::max)(3, static_cast<int>(info.srWindow.Bottom - info.srWindow.Top + 1));
+        Columns = (std::max)(8, static_cast<int>(info.srWindow.Right - info.srWindow.Left + 1));
+        int logRow = (std::min)(Rows - 1, static_cast<int>(info.dwCursorPosition.Y - info.srWindow.Top + 2));
+        QueueText("\033[?25l\r\n\033[1;" + std::to_string(Rows - 1) + "r\033[" + std::to_string(logRow) +
+                  ";1H\x1b\x37\033[?2004h" + Editor.Render(Rows, Columns, CodePage()) + "\033[?25h");
+    }
+
+    void WatchSize()
+    {
+        if (Stopped)
+            return;
+        ResizeTimer.expires_after(std::chrono::milliseconds(200));
+        ResizeTimer.async_wait([this](const boost::system::error_code &ec) {
+            if (ec || Stopped)
+                return;
+            CONSOLE_SCREEN_BUFFER_INFO info = {};
+            if (Local && GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info) &&
+                (Columns != info.srWindow.Right - info.srWindow.Left + 1 ||
+                 Rows != info.srWindow.Bottom - info.srWindow.Top + 1))
+            {
+                QueueText(EndFooter());
+                BeginFooter();
+            }
+            WatchSize();
+        });
+    }
+
+    boost::asio::io_service &IoContext;
+    CONSOLE_WRITE_QUEUE &Queue;
+    SERIAL_CONFIG &Config;
+    LOCAL_LINE_EDITOR &Editor;
+    boost::asio::steady_timer ResizeTimer;
+    HIGHLIGHT_OUTPUT_STATE Highlight;
+    RECEIVE_FORMATTER Formatter;
+    bool Local = false;
+    bool Stopped = false;
+    int Rows = 24;
+    int Columns = 80;
+};
 
 typedef struct
 {
@@ -712,11 +837,11 @@ public:
         boost::asio::io_service& ioctx,
         SERIAL_CONFIG& cfg,
         SERIAL_WRITE_QUEUE& writeQueue,
-        CONSOLE_WRITE_QUEUE& consoleWriteQueue)
+        TERMINAL_DISPLAY& display)
         : IoContext(ioctx),
           Config(cfg),
           WriteQueue(writeQueue),
-          ConsoleWriteQueue(consoleWriteQueue),
+          Display(display),
           Stopping(false),
           CommandPending(false),
           ServerInitialized(false),
@@ -1082,16 +1207,10 @@ private:
         }
 
         g_isCtrlAPressed = false;
-        g_lineBuffer.clear();
-        std::vector<uint8_t> displayOutput;
-        AppendAnsiSequence(displayOutput, "\r\n\033[96m[External] > \033[39m");
-        displayOutput.insert(displayOutput.end(), displayCommand.begin(), displayCommand.end());
-        AppendAnsiSequence(displayOutput, "\r\n");
-        ConsoleWriteQueue.Enqueue(std::move(displayOutput));
 
         WriteQueue.Enqueue(
             std::move(command),
-            [this, requestId, encodingFormat, prompt = std::move(prompt)]() mutable
+            [this, requestId, encodingFormat, prompt = std::move(prompt), displayCommand = std::move(displayCommand)]() mutable
             {
                 std::lock_guard<std::mutex> lock(ResponseMutex);
                 if (Stopping.load() || requestId != ActiveRequestId || RequestFinished)
@@ -1101,6 +1220,7 @@ private:
                 EncodingFormat = encodingFormat;
                 Prompt = std::move(prompt);
                 RequestStarted = true;
+                Display.Sent(displayCommand, true);
                 LastDataTime = std::chrono::steady_clock::now();
                 ResponseChanged.notify_all();
                 return true;
@@ -1132,7 +1252,7 @@ private:
     boost::asio::io_service& IoContext;
     SERIAL_CONFIG& Config;
     SERIAL_WRITE_QUEUE& WriteQueue;
-    CONSOLE_WRITE_QUEUE& ConsoleWriteQueue;
+    TERMINAL_DISPLAY& Display;
     std::atomic<bool> Stopping;
     std::atomic<bool> CommandPending;
     std::thread Worker;
@@ -1156,176 +1276,154 @@ private:
     std::chrono::steady_clock::time_point LastDataTime;
 };
 
-static void DoSerialToConsole(
-    boost::asio::serial_port& serialPort,
-    CONSOLE_WRITE_QUEUE& consoleWriteQueue,
-    std::vector<uint8_t>& buffer,
-    SERIAL_CONFIG& cfg,
-    const std::shared_ptr<HIGHLIGHT_OUTPUT_STATE>& highlightState,
-    AUTOMATION_SERVER& automationServer)
+static void DoSerialToConsole(boost::asio::serial_port &serialPort, std::vector<uint8_t> &buffer,
+                              TERMINAL_DISPLAY &display, AUTOMATION_SERVER &automationServer)
 {
-    serialPort.async_read_some(
-        boost::asio::buffer(buffer.data(), buffer.size()),
-        [&serialPort, &consoleWriteQueue, &buffer, &cfg, highlightState, &automationServer](const boost::system::error_code& ec, std::size_t bytesTransferred)
+    serialPort.async_read_some(boost::asio::buffer(buffer), [&serialPort, &buffer, &display, &automationServer](
+                                                                const boost::system::error_code &ec, size_t size) {
+        auto receivedAt = LocalTimestamp();
+        if (ec)
         {
-            if (ec)
-            {
-                auto remainingOutput = BuildHighlightedOutput(*highlightState, nullptr, 0, true);
-                if (!remainingOutput.empty())
-                {
-                    consoleWriteQueue.Enqueue(std::move(remainingOutput));
-                }
-                std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
-                return;
-            }
-
-            automationServer.OnSerialData(buffer.data(), bytesTransferred);
-            std::vector<uint8_t> output;
-            if (highlightState->EncodingFormat != cfg.EncodingFormat)
-            {
-                output = BuildHighlightedOutput(*highlightState, nullptr, 0, true);
-                ResetHighlightOutputState(*highlightState, cfg);
-            }
-            auto currentOutput = BuildHighlightedOutput(*highlightState, buffer.data(), bytesTransferred, false);
-            output.insert(output.end(), currentOutput.begin(), currentOutput.end());
-            if (output.empty())
-            {
-                DoSerialToConsole(serialPort, consoleWriteQueue, buffer, cfg, highlightState, automationServer);
-                return;
-            }
-
-            consoleWriteQueue.Enqueue(
-                std::move(output),
-                {},
-                [](const boost::system::error_code& writeError)
-                {
-                    if (writeError)
-                    {
-                        std::cerr << "\033[31m" << "error : " << writeError.message() << "\033[0m" << std::endl;
-                    }
-                });
-            DoSerialToConsole(serialPort, consoleWriteQueue, buffer, cfg, highlightState, automationServer);
-        });
+            display.Message("[Error] Serial receive: " + ec.message());
+            display.Stop();
+            return;
+        }
+        automationServer.OnSerialData(buffer.data(), size);
+        display.Receive(buffer.data(), size, receivedAt);
+        DoSerialToConsole(serialPort, buffer, display, automationServer);
+    });
 }
 
-static void DoConsoleToSerial(
-    boost::asio::windows::stream_handle& consoleInput,
-    SERIAL_WRITE_QUEUE& writeQueue,
-    CONSOLE_WRITE_QUEUE& consoleWriteQueue,
-    std::vector<uint8_t>& buffer,
-    SERIAL_CONFIG& cfg,
-    AUTOMATION_SERVER& automationServer)
+static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput, SERIAL_WRITE_QUEUE &writeQueue,
+                              std::vector<uint8_t> &buffer, SERIAL_CONFIG &cfg, TERMINAL_DISPLAY &display,
+                              LOCAL_LINE_EDITOR &editor, COMMAND_HISTORY &history, AUTOMATION_SERVER &automationServer)
 {
-    consoleInput.async_read_some(
-        boost::asio::buffer(buffer.data(), buffer.size()),
-        [&consoleInput, &writeQueue, &consoleWriteQueue, &buffer, &cfg, &automationServer](const boost::system::error_code& ec, std::size_t bytesTransferred)
+    consoleInput.async_read_some(boost::asio::buffer(buffer), [&consoleInput, &writeQueue, &buffer, &cfg, &display,
+                                                               &editor, &history, &automationServer](
+                                                                  const boost::system::error_code &ec, size_t size) {
+        if (ec)
         {
-            if (ec)
+            if (ec != boost::asio::error::operation_aborted)
+                display.Message("[Error] Console input: " + ec.message());
+            display.Stop();
+            return;
+        }
+        bool ignored = false;
+        std::vector<uint8_t> rawInput;
+        auto flushRaw = [&]() {
+            if (!rawInput.empty())
             {
-                if (ec != boost::asio::error::operation_aborted)
-                {
-                    std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
-                }
-                return;
+                writeQueue.Enqueue(std::move(rawInput));
+                rawInput.clear();
             }
-
+        };
+        for (size_t i = 0; i < size; ++i)
+        {
+            auto byte = buffer[i];
+            if (g_isCtrlAPressed)
+            {
+                g_isCtrlAPressed = false;
+                flushRaw();
+                auto next = cfg;
+                if (byte == 24)
+                {
+                    if (MessageBoxW(nullptr, L"确定要退出程序吗？", L"退出确认", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                    {
+                        g_shouldExit = true;
+                        consoleInput.cancel();
+                        display.Stop();
+                        return;
+                    }
+                }
+                else if (byte == 3)
+                {
+                    next.EncodingFormat = cfg.EncodingFormat == 0 ? 1 : 0;
+                    auto codePage = next.EncodingFormat == 0 ? CP_UTF8 : 936;
+                    if (!editor.Text().empty() && EncodeTerminalText(editor.Text(), codePage).empty())
+                    {
+                        display.Message("[Error] Input cannot be represented in the selected encoding; draft kept");
+                        continue;
+                    }
+                    display.Configure(next);
+                    WriteSerialConfig(cfg);
+                    display.Message(std::string("Encoding: ") + (cfg.EncodingFormat == 0 ? "UTF-8" : "GBK"));
+                }
+                else if (byte == 5)
+                {
+                    next.EchoMode = cfg.EchoMode == 0 ? 1 : 0;
+                    display.Configure(next);
+                    WriteSerialConfig(cfg);
+                    display.Message(cfg.EchoMode ? "Input: local editor (history enabled)" : "Input: raw passthrough");
+                }
+                else if (byte == 20)
+                {
+                    next.Timestamps = cfg.Timestamps ? 0 : 1;
+                    display.Configure(next);
+                    WriteSerialConfig(cfg);
+                    display.Message(cfg.Timestamps ? "Timestamps: on" : "Timestamps: off");
+                }
+                continue;
+            }
+            if (byte == 1)
+            {
+                g_isCtrlAPressed = true;
+                continue;
+            }
             if (automationServer.IsCommandActive())
             {
-                ShowKeyboardInputIgnored(consoleWriteQueue);
-                if (!g_shouldExit)
-                {
-                    DoConsoleToSerial(consoleInput, writeQueue, consoleWriteQueue, buffer, cfg, automationServer);
-                }
-                return;
+                ignored = true;
+                continue;
+            }
+            if (cfg.EchoMode == 0)
+            {
+                rawInput.push_back(byte);
+                continue;
             }
 
-            bool skipWrite = false;
-            for (size_t i = 0; i < bytesTransferred; i++)
+            auto action = editor.Feed(byte, display.CodePage());
+            if (action == INPUT_ACTION::Submit)
             {
-                uint8_t ch = buffer[i];
-
-                if (ch == 1)
+                auto command = editor.Text();
+                auto bytes = EncodeTerminalText(command, display.CodePage());
+                if (!command.empty() && bytes.empty())
                 {
-                    g_isCtrlAPressed = true;
-                    skipWrite = true;
-                    break;
+                    display.Message("[Error] Cannot encode command; draft kept");
+                    continue;
                 }
-
-                if (g_isCtrlAPressed)
-                {
-                    g_isCtrlAPressed = false;
-                    skipWrite = true;
-
-                    if (ch == 24)
-                    {
-                        if (MessageBoxW(NULL, L"确定要退出程序吗？", L"退出确认", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                auto displayed = bytes;
+                // 与透传模式的 Enter 一致；CRLF 会让 Linux shell 再提交一次空行
+                bytes.push_back('\r');
+                editor.Clear();
+                writeQueue.Enqueue(
+                    std::move(bytes),
+                    [&display, displayed]() {
+                        display.Sent(displayed, false);
+                        return true;
+                    },
+                    [&history, &display, command](const boost::system::error_code &error) {
+                        if (error)
                         {
-                            g_shouldExit = true;
-                            consoleInput.cancel();
-                            exit(0);
+                            display.Message("[Error] Serial send: " + error.message());
+                            return;
                         }
-                    }
-                    else if (ch == 3)
-                    {
-                        ToggleEncodingFormat(cfg);
-                    }
-                    else if (ch == 5)
-                    {
-                        ToggleEchoMode(cfg);
-                    }
-                    break;
-                }
+                        auto saved = history.Remember(command);
+                        if (saved)
+                            display.Message("[Error] History was not saved (Windows error " + std::to_string(saved) +
+                                            ")");
+                        display.Redraw();
+                    });
             }
-
-            if (!skipWrite && automationServer.IsCommandActive())
-            {
-                skipWrite = true;
-                ShowKeyboardInputIgnored(consoleWriteQueue);
-            }
-
-            if (!skipWrite && cfg.EchoMode == 1)
-            {
-                skipWrite = true;
-                for (size_t i = 0; i < bytesTransferred; i++)
-                {
-                    uint8_t ch = buffer[i];
-                    if (ch == 8 || ch == 127)
-                    {
-                        if (!g_lineBuffer.empty())
-                        {
-                            g_lineBuffer.pop_back();
-                            std::cout << "\b \b";
-                        }
-                        continue;
-                    }
-
-                    if (ch == '\r' || ch == '\n')
-                    {
-                        g_lineBuffer.push_back('\r');
-                        g_lineBuffer.push_back('\n');
-                        writeQueue.Enqueue(g_lineBuffer);
-                        g_lineBuffer.clear();
-                        std::cout << "\n";
-                        continue;
-                    }
-
-                    g_lineBuffer.push_back(ch);
-                    std::cout << static_cast<char>(ch);
-                    std::cout.flush();
-                }
-            }
-
-            if (!skipWrite && cfg.EchoMode == 0)
-            {
-                writeQueue.Enqueue(std::vector<uint8_t>(buffer.begin(), buffer.begin() + bytesTransferred));
-            }
-
-            if (!g_shouldExit)
-            {
-                DoConsoleToSerial(consoleInput, writeQueue, consoleWriteQueue, buffer, cfg, automationServer);
-            }
+            else if (action == INPUT_ACTION::Interrupt || action == INPUT_ACTION::EndOfFile)
+                writeQueue.Enqueue({static_cast<uint8_t>(action == INPUT_ACTION::Interrupt ? 3 : 4)});
+            else if (action == INPUT_ACTION::Rejected)
+                display.Message("[Error] Input rejected: invalid character or command longer than 4096 characters");
         }
-    );
+        flushRaw();
+        if (ignored)
+            display.Message("[External] Command is running; keyboard input ignored");
+        display.Redraw();
+        DoConsoleToSerial(consoleInput, writeQueue, buffer, cfg, display, editor, history, automationServer);
+    });
 }
 
 static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::asio::serial_port& serialPort, SERIAL_CONFIG& cfg)
@@ -1350,28 +1448,28 @@ static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::a
 
     SERIAL_WRITE_QUEUE writeQueue(serialPort);
     CONSOLE_WRITE_QUEUE consoleWriteQueue(stdoutput);
-    AUTOMATION_SERVER automationServer(ioctx, cfg, writeQueue, consoleWriteQueue);
+    COMMAND_HISTORY history;
+    std::wstring historyPath;
+    auto historyError = CommandHistoryPath(historyPath);
+    if (!historyError) historyError = history.Load(historyPath);
+    LOCAL_LINE_EDITOR editor(history);
+    TERMINAL_DISPLAY display(ioctx, consoleWriteQueue, cfg, editor);
+    AUTOMATION_SERVER automationServer(ioctx, cfg, writeQueue, display);
     if (automationServer.Start())
     {
         std::cout << "\033[32mExternal control: \\.\\pipe\\SerialForWindowsTerminal\033[39m" << std::endl;
-        std::cout << "\033[33mUse .\\SerialTerminalCtl.exe exec \"ls\"\033[39m" << std::endl;
+        std::cout << "\033[33mUse .\\SerialTerminalCtl.exe exec --line-ending cr \"ls\"\033[39m" << std::endl;
     }
     else
     {
         std::cout << "\033[93mExternal control unavailable; another terminal may own the pipe\033[39m" << std::endl;
     }
 
-    // 串口接收内容在写入终端前应用关键词高亮规则
-    DoSerialToConsole(
-        serialPort,
-        consoleWriteQueue,
-        serialPortRecvBuffer,
-        cfg,
-        CreateHighlightOutputState(cfg),
-        automationServer);
-    // 对于输入到串口的流，传递配置指针以支持快捷键处理
-    DoConsoleToSerial(stdinput, writeQueue, consoleWriteQueue, serialPortSendBuffer, cfg, automationServer);
-    
+    display.Start();
+    if (historyError) display.Message("[Error] Cannot load history (Windows error " + std::to_string(historyError) + ")");
+    DoSerialToConsole(serialPort, serialPortRecvBuffer, display, automationServer);
+    DoConsoleToSerial(stdinput, writeQueue, serialPortSendBuffer, cfg, display, editor, history, automationServer);
+
     // 重置退出标志
     g_shouldExit = false;
     
@@ -1442,9 +1540,10 @@ int wmain(int argc, const WCHAR* args[])
                     // 显示当前编码格式
                     std::cout << "\033[36mVersion: v1.0.0\033[0m" << std::endl;
                     std::cout << "\033[32mConsole encoding: " << (cfg.EncodingFormat == 0 ? "UTF-8" : "GBK") << "\033[0m" << std::endl;
-                    std::cout << "\033[32mEcho mode: " << (cfg.EchoMode == 0 ? "Off" : "On") << "\033[0m" << std::endl;
+                    std::cout << "\033[32mInput: " << (cfg.EchoMode == 0 ? "raw passthrough" : "local editor (history enabled)") << "\033[0m" << std::endl;
                     std::cout << "\033[33mPress Ctrl+A then Ctrl+C to toggle encoding format\033[0m" << std::endl;
-                    std::cout << "\033[33mPress Ctrl+A then Ctrl+E to toggle echo mode\033[0m" << std::endl;
+                    std::cout << "\033[33mPress Ctrl+A then Ctrl+E to toggle raw/local input\033[0m" << std::endl;
+                    std::cout << "\033[33mPress Ctrl+A then Ctrl+T to toggle timestamps\033[0m" << std::endl;
                     std::cout << "\033[33mPress Ctrl+A then Ctrl+X to exit\033[0m" << std::endl;
 
                     // 运行工作循环，传递配置
@@ -1609,9 +1708,10 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
 
         // 添加回显模式复选框
         auto hWndEchoMode = GetDlgItem(hDlg, IDC_COMBO_ECHO);
-        ComboBox_AddString(hWndEchoMode, L"关闭");
-        ComboBox_AddString(hWndEchoMode, L"开启");
+        ComboBox_AddString(hWndEchoMode, L"字符透传");
+        ComboBox_AddString(hWndEchoMode, L"本地编辑（历史建议）");
         ComboBox_SetCurSel(hWndEchoMode, (int)(cfg.EchoMode));
+        CheckDlgButton(hDlg, IDC_CHECK_TIMESTAMPS, cfg.Timestamps ? BST_CHECKED : BST_UNCHECKED);
 
         auto hWndHighlightColor = GetDlgItem(hDlg, IDC_COMBO_HIGHLIGHT_COLOR);
         for (DWORD color = 0; color < HIGHLIGHT_COLOR_COUNT; ++color)
@@ -1735,6 +1835,7 @@ INT_PTR CALLBACK SettingFunc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lPar
                 // 获取回显模式复选框状态
                 auto hWndEchoMode = GetDlgItem(hDlg, IDC_COMBO_ECHO);
                 cfg.EchoMode = ComboBox_GetCurSel(hWndEchoMode);
+                cfg.Timestamps = IsDlgButtonChecked(hDlg, IDC_CHECK_TIMESTAMPS) == BST_CHECKED ? 1 : 0;
 
                 auto state = GetSettingDialogState(hDlg);
                 if (state != nullptr)

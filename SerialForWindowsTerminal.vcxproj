@@ -158,6 +158,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="framework.h" />
+    <ClInclude Include="TerminalInteraction.h" />
     <ClInclude Include="Resource.h" />
     <ClInclude Include="SerialAutomationProtocol.h" />
     <ClInclude Include="SerialForWindowsTerminal.h" />
@@ -165,6 +166,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="SerialForWindowsTerminal.cpp" />
+    <ClCompile Include="TerminalInteraction.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="SerialForWindowsTerminal.rc" />
