@@ -231,6 +231,100 @@ static void TestLocalSubmission(const std::wstring& historyPath, const std::stri
     Check(sent == expected, name);
 }
 
+static void TestErrorEncoding()
+{
+    wchar_t systemMessage[1024] = {};
+    auto length = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+                                 ERROR_OPERATION_ABORTED, 0, systemMessage, _countof(systemMessage), nullptr);
+    Check(length != 0, "Windows error description is available for the encoding check");
+    if (!length) return;
+    while (length && (systemMessage[length - 1] == L'\r' || systemMessage[length - 1] == L'\n')) --length;
+    std::wstring expected(systemMessage, length);
+    for (UINT codePage : {static_cast<UINT>(CP_UTF8), 936U})
+    {
+        auto text = ErrorMessage({ERROR_OPERATION_ABORTED, boost::system::system_category()}, codePage);
+        Check(text.find("995: ") == 0, "error description retains its numeric Windows code");
+        auto detail = text.substr((std::min)(size_t(5), text.size()));
+        auto count = MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, detail.data(), static_cast<int>(detail.size()), nullptr, 0);
+        std::wstring decoded(count, L'\0');
+        if (count) MultiByteToWideChar(codePage, MB_ERR_INVALID_CHARS, detail.data(), static_cast<int>(detail.size()), &decoded[0], count);
+        Check(decoded == expected, codePage == CP_UTF8 ? "Windows error text decodes correctly as UTF-8" :
+                                                       "Windows error text decodes correctly as GBK");
+    }
+}
+
+static void TestSerialTermination(bool cancelled, bool stopping)
+{
+    TEST_BYTE_PIPE serialPipe, outputPipe;
+    boost::asio::io_service io;
+    boost::asio::serial_port serial(io);
+    serial.assign(serialPipe.TakeServer());
+    boost::asio::windows::stream_handle output(io, outputPipe.TakeServer());
+    SERIAL_WRITE_QUEUE serialQueue(serial);
+    CONSOLE_WRITE_QUEUE outputQueue(output);
+    SERIAL_CONFIG cfg = {};
+    COMMAND_HISTORY history;
+    LOCAL_LINE_EDITOR editor(history);
+    TERMINAL_DISPLAY display(io, outputQueue, cfg, editor);
+    AUTOMATION_SERVER automation(io, cfg, serialQueue, display);
+    std::vector<uint8_t> buffer(1024);
+    DoSerialToConsole(serial, buffer, display, automation);
+    if (stopping)
+        display.Cancel();
+    if (cancelled)
+        serial.cancel();
+    else
+    {
+        CloseHandle(serialPipe.Client);
+        serialPipe.Client = INVALID_HANDLE_VALUE;
+    }
+    io.run_for(std::chrono::seconds(2));
+
+    DWORD available = 0;
+    Check(PeekNamedPipe(outputPipe.Client, nullptr, 0, nullptr, &available, nullptr) != FALSE,
+          "serial termination output remains readable");
+    std::string text(available, '\0');
+    DWORD read = 0;
+    if (available) ReadFile(outputPipe.Client, &text[0], available, &read, nullptr);
+    text.resize(read);
+    if (stopping)
+    {
+        Check(!display.ExitError(), "intentional read cancellation is not a disconnect failure");
+        Check(text.empty(), "intentional cancellation emits no disconnect warning");
+    }
+    else
+    {
+        Check(display.ExitError().value() != 0, "serial disconnect preserves a nonzero exit error");
+        if (cancelled)
+            Check(display.ExitError() == boost::asio::error::operation_aborted,
+                  "unexpected driver cancellation remains an error while the session is active");
+        Check(io.stopped(), "serial disconnect completes output and stops the event loop");
+        Check(text.find("[Error] Serial receive:") != std::string::npos &&
+              text.find("reopen this terminal profile") != std::string::npos,
+              "serial disconnect displays both the cause and the recovery action");
+    }
+}
+
+static void TestCancelledWrites()
+{
+    TEST_BYTE_PIPE serialPipe;
+    boost::asio::io_service io;
+    boost::asio::serial_port serial(io);
+    serial.assign(serialPipe.TakeServer());
+    SERIAL_WRITE_QUEUE queue(serial);
+    bool nextStarted = false;
+    bool completed = false;
+    // 大于管道缓冲区的写入保持挂起，检查退出时不会再发送排队命令
+    queue.Enqueue(std::vector<uint8_t>(32768, 'x'), {}, [&](const boost::system::error_code&) { completed = true; });
+    queue.Enqueue({'n', 'e', 'x', 't'}, [&]() { nextStarted = true; return true; });
+    queue.Stop();
+    serial.cancel();
+    io.run_for(std::chrono::seconds(2));
+    Check(io.stopped(), "cancelled write releases the event loop");
+    Check(!nextStarted, "shutdown discards queued serial commands");
+    Check(!completed, "shutdown does not run normal write completion actions");
+}
+
 static int Preview(const std::wstring& path)
 {
     SetConsoleTitleW(L"Serial terminal - timestamp and history verification");
@@ -296,6 +390,11 @@ int wmain(int argc, const wchar_t* argv[])
     TestLocalSubmission(submissionHistory, "echo hi\r", "echo hi\r", "Enter writes one CR without an extra blank submission");
     TestLocalSubmission(submissionHistory, "echo hi\r\n", "echo hi\r", "CRLF console input submits the command only once");
     TestLocalSubmission(submissionHistory, "\r", "\r", "empty Enter writes one CR");
+    TestErrorEncoding();
+    TestSerialTermination(false, false);
+    TestSerialTermination(true, false);
+    TestSerialTermination(true, true);
+    TestCancelledWrites();
     std::cout << Checks << " checks, " << Failures << " failures\n";
     return Failures ? 1 : 0;
 }

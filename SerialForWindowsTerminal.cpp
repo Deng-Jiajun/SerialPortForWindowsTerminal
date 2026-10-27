@@ -18,6 +18,7 @@
 #include <thread>
 #include <vector>
 #include <boost/asio.hpp> 
+#include <boost/asio/windows/object_handle.hpp>
 #include <boost/asio/windows/stream_handle.hpp>
 
 #define MAX_LOADSTRING 100
@@ -31,6 +32,46 @@ INT_PTR CALLBACK    SettingFunc(HWND, UINT, WPARAM, LPARAM);
 bool g_isCtrlAPressed = false;
 // 添加全局标志来控制程序退出
 bool g_shouldExit = false;
+
+// 控制台回调在系统线程运行；句柄保留到进程结束，避免退出时与回调争用析构资源
+static HANDLE g_consoleCloseRequested = nullptr;
+static HANDLE g_consoleMainThread = nullptr;
+
+static BOOL WINAPI ConsoleControlHandler(DWORD event)
+{
+    if (event != CTRL_CLOSE_EVENT && event != CTRL_LOGOFF_EVENT && event != CTRL_SHUTDOWN_EVENT)
+        return FALSE;
+
+    SetEvent(g_consoleCloseRequested);
+    // 主线程正常退出会结束整个进程；清理超时后返回 TRUE，仍不再调用后续失效回调
+    WaitForSingleObject(g_consoleMainThread, 3000);
+    return TRUE;
+}
+
+static bool RegisterConsoleControlHandler()
+{
+    // 设置对话框可能加载输入法并注册回调，关闭对话框后重新排到处理列表首位
+    SetConsoleCtrlHandler(ConsoleControlHandler, FALSE);
+    return SetConsoleCtrlHandler(ConsoleControlHandler, TRUE) != FALSE;
+}
+
+static std::string ErrorMessage(const boost::system::error_code& error, UINT codePage)
+{
+    auto result = std::to_string(error.value());
+    if (error.category() != boost::system::system_category())
+        return result + ": " + error.message();
+
+    // Boost 1.68 的系统错误文本使用系统代码页，不能直接写到 UTF-8 终端
+    wchar_t message[1024] = {};
+    auto size = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr,
+                              error.value(), 0, message, _countof(message), nullptr);
+    while (size && (message[size - 1] == L'\r' || message[size - 1] == L'\n'))
+        --size;
+    auto bytes = EncodeTerminalText(std::wstring(message, size), codePage);
+    if (!bytes.empty())
+        result += ": " + std::string(bytes.begin(), bytes.end());
+    return result;
+}
 
 enum HIGHLIGHT_COLOR : DWORD
 {
@@ -583,6 +624,8 @@ public:
         std::function<bool()> started = {},
         std::function<void(const boost::system::error_code&)> completed = {})
     {
+        if (Stopped)
+            return;
         auto wasIdle = Queue.empty();
         Queue.push_back({
             std::make_shared<std::vector<uint8_t>>(std::move(data)),
@@ -595,9 +638,19 @@ public:
         }
     }
 
+    void Stop()
+    {
+        Stopped = true;
+    }
+
 private:
     void StartNext()
     {
+        if (Stopped)
+        {
+            Queue.clear();
+            return;
+        }
         if (Queue.empty())
         {
             return;
@@ -632,7 +685,7 @@ private:
             [this, item](const boost::system::error_code& ec, std::size_t)
             {
                 Queue.pop_front();
-                if (item.Completed)
+                if (!Stopped && item.Completed)
                 {
                     item.Completed(ec);
                 }
@@ -642,6 +695,7 @@ private:
 
     TStream& Stream;
     std::deque<SERIAL_WRITE_ITEM> Queue;
+    bool Stopped = false;
 };
 
 using SERIAL_WRITE_QUEUE = ASYNC_WRITE_QUEUE<boost::asio::serial_port>;
@@ -730,12 +784,29 @@ class TERMINAL_DISPLAY
             QueueText("\033[?25l" + Editor.Render(Rows, Columns, CodePage()) + "\033[?25h");
     }
 
-    void Stop()
+    bool IsStopped() const
+    {
+        return Stopped;
+    }
+
+    boost::system::error_code ExitError() const
+    {
+        return Failure;
+    }
+
+    void Cancel()
+    {
+        Stopped = true;
+        boost::system::error_code ignored;
+        ResizeTimer.cancel(ignored);
+    }
+
+    void Stop(const boost::system::error_code& error = {})
     {
         if (Stopped)
             return;
-        Stopped = true;
-        ResizeTimer.cancel();
+        Failure = error;
+        Cancel();
         auto pending = Formatter.Flush();
         Write(BuildHighlightedOutput(Highlight, pending.data(), pending.size(), true));
         std::string end = Local ? EndFooter() : "";
@@ -818,6 +889,7 @@ class TERMINAL_DISPLAY
     RECEIVE_FORMATTER Formatter;
     bool Local = false;
     bool Stopped = false;
+    boost::system::error_code Failure;
     int Rows = 24;
     int Columns = 80;
 };
@@ -895,7 +967,12 @@ public:
 
         Stopping.store(true);
         ResponseChanged.notify_all();
-        CancelSynchronousIo(static_cast<HANDLE>(Worker.native_handle()));
+        auto workerHandle = static_cast<HANDLE>(Worker.native_handle());
+        // 取消可能早于工作线程进入同步 I/O，等待期间继续取消，避免 join 卡在管道读写
+        do
+        {
+            CancelSynchronousIo(workerHandle);
+        } while (WaitForSingleObject(workerHandle, 20) == WAIT_TIMEOUT);
         Worker.join();
     }
 
@@ -1281,11 +1358,15 @@ static void DoSerialToConsole(boost::asio::serial_port &serialPort, std::vector<
 {
     serialPort.async_read_some(boost::asio::buffer(buffer), [&serialPort, &buffer, &display, &automationServer](
                                                                 const boost::system::error_code &ec, size_t size) {
+        if (display.IsStopped())
+            return;
         auto receivedAt = LocalTimestamp();
         if (ec)
         {
-            display.Message("[Error] Serial receive: " + ec.message());
-            display.Stop();
+            // USB 拔出也可能返回 operation_aborted；只有已进入退出流程时才忽略取消
+            display.Message("[Error] Serial receive: " + ErrorMessage(ec, display.CodePage()));
+            display.Message("Serial connection closed. Check the connection and reopen this terminal profile.");
+            display.Stop(ec);
             return;
         }
         automationServer.OnSerialData(buffer.data(), size);
@@ -1301,11 +1382,12 @@ static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput,
     consoleInput.async_read_some(boost::asio::buffer(buffer), [&consoleInput, &writeQueue, &buffer, &cfg, &display,
                                                                &editor, &history, &automationServer](
                                                                   const boost::system::error_code &ec, size_t size) {
+        if (display.IsStopped())
+            return;
         if (ec)
         {
-            if (ec != boost::asio::error::operation_aborted)
-                display.Message("[Error] Console input: " + ec.message());
-            display.Stop();
+            display.Message("[Error] Console input: " + ErrorMessage(ec, display.CodePage()));
+            display.Stop(ec);
             return;
         }
         bool ignored = false;
@@ -1327,7 +1409,15 @@ static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput,
                 auto next = cfg;
                 if (byte == 24)
                 {
-                    if (MessageBoxW(nullptr, L"确定要退出程序吗？", L"退出确认", MB_YESNO | MB_ICONQUESTION) == IDYES)
+                    auto answer = MessageBoxW(nullptr, L"确定要退出程序吗？", L"退出确认", MB_YESNO | MB_ICONQUESTION);
+                    if (!RegisterConsoleControlHandler())
+                    {
+                        boost::system::error_code error(GetLastError(), boost::system::system_category());
+                        display.Message("[Error] Console close handler: " + ErrorMessage(error, display.CodePage()));
+                        display.Stop(error);
+                        return;
+                    }
+                    if (answer == IDYES)
                     {
                         g_shouldExit = true;
                         consoleInput.cancel();
@@ -1403,7 +1493,8 @@ static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput,
                     [&history, &display, command](const boost::system::error_code &error) {
                         if (error)
                         {
-                            display.Message("[Error] Serial send: " + error.message());
+                            display.Message("[Error] Serial send: " + ErrorMessage(error, display.CodePage()));
+                            display.Stop(error);
                             return;
                         }
                         auto saved = history.Remember(command);
@@ -1446,6 +1537,17 @@ static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::a
     if (stdoutput.assign(conout, ec))
         return ec;
 
+    HANDLE closeEvent = nullptr;
+    if (!DuplicateHandle(GetCurrentProcess(), g_consoleCloseRequested, GetCurrentProcess(), &closeEvent,
+                         SYNCHRONIZE, FALSE, 0))
+        return boost::system::error_code(GetLastError(), boost::system::system_category());
+    boost::asio::windows::object_handle closeNotification(ioctx, closeEvent);
+    bool cleaningUp = false;
+    closeNotification.async_wait([&](const boost::system::error_code& error) {
+        if (!error && !cleaningUp)
+            ioctx.stop();
+    });
+
     SERIAL_WRITE_QUEUE writeQueue(serialPort);
     CONSOLE_WRITE_QUEUE consoleWriteQueue(stdoutput);
     COMMAND_HISTORY history;
@@ -1474,8 +1576,23 @@ static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::a
     g_shouldExit = false;
     
     ioctx.run(ec);
+    cleaningUp = true;
+    display.Cancel();
+    writeQueue.Stop();
+    consoleWriteQueue.Stop();
+    boost::system::error_code ignored;
+    closeNotification.cancel(ignored);
+    stdinput.cancel(ignored);
+    stdoutput.cancel(ignored);
+    serialPort.cancel(ignored);
     automationServer.Stop();
-    return ec;
+
+    // 等取消完成后再释放接收缓冲区，取消回调不能重新发起读写
+    ioctx.restart();
+    ioctx.run(ignored);
+    if (WaitForSingleObject(g_consoleCloseRequested, 0) == WAIT_OBJECT_0)
+        return {};
+    return display.ExitError() ? display.ExitError() : ec;
 }
 
 int wmain(int argc, const WCHAR* args[])
@@ -1484,6 +1601,15 @@ int wmain(int argc, const WCHAR* args[])
     boost::asio::io_service ioctx;
     boost::asio::serial_port serialPort(ioctx);
     hInstance = GetModuleHandle(nullptr);
+
+    g_consoleCloseRequested = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!g_consoleCloseRequested)
+        return GetLastError();
+    if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_consoleMainThread,
+                         SYNCHRONIZE, FALSE, 0))
+        return GetLastError();
+    if (!RegisterConsoleControlHandler())
+        return GetLastError();
 
     DWORD consoleMode = 0;
     auto conin = GetStdHandle(STD_INPUT_HANDLE);
@@ -1506,7 +1632,12 @@ int wmain(int argc, const WCHAR* args[])
         auto hWndParent = ::GetForegroundWindow();
         if (hWndParent == nullptr)
             hWndParent = GetConsoleWindow();
-        if (DialogBoxParam(hInstance, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWndParent, SettingFunc, 1) == IDOK)
+        auto selection = DialogBoxParam(hInstance, MAKEINTRESOURCE(IDD_SETTING_DIALOG), hWndParent, SettingFunc, 1);
+        if (!RegisterConsoleControlHandler())
+            return GetLastError();
+        if (WaitForSingleObject(g_consoleCloseRequested, 0) == WAIT_OBJECT_0)
+            return ERROR_SUCCESS;
+        if (selection == IDOK)
         {
             ioctx.restart();
             auto cfg = ReadSerialConfig();
@@ -1514,13 +1645,13 @@ int wmain(int argc, const WCHAR* args[])
             if (serialPort.open(portName, ec))
             {
                 std::cerr << "\033[31m" << "can not open " << portName << "\033[0m" <<std::endl;
-                std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
+                std::cerr << "\033[31m" << "error : " << ErrorMessage(ec, GetConsoleOutputCP()) << "\033[0m" << std::endl;
                 continue;
             }
             if (InitializeSerialPort(serialPort, cfg, ec))
             {
                 std::cerr << "\033[31m" << "can not initialize " << portName << "\033[0m" << std::endl;
-                std::cerr << "\033[31m" << "error : " << ec.message() << "\033[0m" << std::endl;
+                std::cerr << "\033[31m" << "error : " << ErrorMessage(ec, GetConsoleOutputCP()) << "\033[0m" << std::endl;
                 continue;
             }
             else
@@ -1547,7 +1678,9 @@ int wmain(int argc, const WCHAR* args[])
                     std::cout << "\033[33mPress Ctrl+A then Ctrl+X to exit\033[0m" << std::endl;
 
                     // 运行工作循环，传递配置
-                    DoWork(ioctx, serialPort, cfg);
+                    ec = DoWork(ioctx, serialPort, cfg);
+                    if (ec)
+                        return ec.value();
                     
                     // 检查是否需要退出程序
                     if (g_shouldExit)
