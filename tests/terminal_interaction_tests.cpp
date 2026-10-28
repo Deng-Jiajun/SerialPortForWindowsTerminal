@@ -179,8 +179,15 @@ static void TestHistoryAndInput(const std::wstring& path)
     editor.Clear();
     Check(editor.Feed('\n', CP_UTF8) == INPUT_ACTION::None, "CRLF not double submitted after clearing");
     Type(editor, "echo");
-    Check(editor.Feed(3, CP_UTF8) == INPUT_ACTION::Interrupt && editor.Text().empty(), "Ctrl+C clears input and interrupts device");
-    Check(editor.Feed(4, CP_UTF8) == INPUT_ACTION::EndOfFile, "empty Ctrl+D reaches device");
+    for (auto key : {3, 4, 6, 21, 23})
+        Check(editor.Feed(static_cast<uint8_t>(key), CP_UTF8) == INPUT_ACTION::None && editor.Text() == L"echo",
+              "removed local control shortcuts preserve the draft");
+    Check(editor.Feed(11, CP_UTF8) == INPUT_ACTION::OpenSettings && editor.Text() == L"echo",
+          "Ctrl+K opens settings without deleting the draft");
+    Type(editor, "\033[200~");
+    Check(editor.Feed(11, CP_UTF8) == INPUT_ACTION::None, "pasted Ctrl+K does not open settings");
+    Type(editor, "\033[201~");
+    editor.Clear();
     Type(editor, std::string(4096, 'x'));
     Check(editor.Feed('y', CP_UTF8) == INPUT_ACTION::Rejected && editor.Text().size() == 4096, "input size bound");
     Check(editor.Render(12, 25, CP_UTF8).find("\033[12;23H") != std::string::npos, "long input scrolls horizontally with visible cursor");
@@ -273,7 +280,7 @@ static void TestLocalSubmission(const std::wstring& historyPath, const std::stri
     DWORD written = 0;
     if (!WriteFile(inputPipe.Client, keys.data(), static_cast<DWORD>(keys.size()), &written, nullptr))
         throw std::runtime_error("cannot write test input");
-    DoConsoleToSerial(input, serialQueue, inputBuffer, cfg, display, editor, history, automation);
+    DoConsoleToSerial(input, serialQueue, inputBuffer, cfg, display, editor, history, automation, []() {});
     io.run_for(std::chrono::milliseconds(200));
     DWORD available = 0;
     if (!PeekNamedPipe(serialPipe.Client, nullptr, 0, nullptr, &available, nullptr))
@@ -284,6 +291,48 @@ static void TestLocalSubmission(const std::wstring& historyPath, const std::stri
         throw std::runtime_error("cannot read test serial output");
     sent.resize(received);
     Check(sent == expected, name);
+}
+
+static void TestSettingsShortcut(bool local)
+{
+    TEST_BYTE_PIPE inputPipe, serialPipe, outputPipe;
+    boost::asio::io_service io;
+    boost::asio::windows::stream_handle input(io, inputPipe.TakeServer());
+    boost::asio::windows::stream_handle output(io, outputPipe.TakeServer());
+    boost::asio::serial_port serial(io);
+    serial.assign(serialPipe.TakeServer());
+    SERIAL_WRITE_QUEUE serialQueue(serial);
+    CONSOLE_WRITE_QUEUE outputQueue(output);
+    SERIAL_CONFIG cfg = {};
+    cfg.EchoMode = local ? 1 : 0;
+    COMMAND_HISTORY history;
+    LOCAL_LINE_EDITOR editor(history);
+    Type(editor, "draft");
+    TERMINAL_DISPLAY display(io, outputQueue, cfg, editor);
+    AUTOMATION_SERVER automation(io, cfg, serialQueue, display);
+    const std::string controls = "\x01\x03\x04\x06\x15\x17";
+    const std::string keys = "\x0b" + controls + "x";
+    DWORD written = 0;
+    if (!WriteFile(inputPipe.Client, keys.data(), static_cast<DWORD>(keys.size()), &written, nullptr))
+        throw std::runtime_error("cannot write settings shortcut test input");
+    int opened = 0;
+    std::wstring openingDraft;
+    std::vector<uint8_t> buffer(1024);
+    DoConsoleToSerial(input, serialQueue, buffer, cfg, display, editor, history, automation, [&]() {
+        ++opened;
+        openingDraft = editor.Text();
+    });
+    io.run_for(std::chrono::milliseconds(200));
+    DWORD available = 0, read = 0;
+    if (!PeekNamedPipe(serialPipe.Client, nullptr, 0, nullptr, &available, nullptr))
+        throw std::runtime_error("cannot inspect settings shortcut serial bytes");
+    std::string sent(available, '\0');
+    if (available) ReadFile(serialPipe.Client, &sent[0], available, &read, nullptr);
+    sent.resize(read);
+    Check(opened == 1 && openingDraft == L"draft", "Ctrl+K opens settings once and preserves the existing draft");
+    Check(sent == (local ? "" : controls + "x"), "only Ctrl+K is intercepted in raw mode; removed local shortcuts send nothing");
+    Check(editor.Text() == (local ? L"draftx" : L"draft"), "old Ctrl+A prefix no longer consumes the next normal character");
+    Check(cfg.EchoMode == (local ? 1u : 0u) && cfg.EncodingFormat == 0, "old Ctrl+A chords do not change settings");
 }
 
 static void TestEchoDisplay(bool local, bool external, bool timeout)
@@ -418,7 +467,7 @@ static void TestCancelledWrites()
     Check(!completed, "shutdown does not run normal write completion actions");
 }
 
-static int Preview(const std::wstring& path)
+static int Preview(const std::wstring& path, bool runtimeSettings = false, HWND settingsParent = nullptr)
 {
     SetConsoleTitleW(L"Serial terminal - timestamp and history verification");
     DWORD mode = 0;
@@ -438,6 +487,8 @@ static int Preview(const std::wstring& path)
     history.Remember(L"make clean && make -j");
     LOCAL_LINE_EDITOR editor(history);
     TERMINAL_DISPLAY display(io, queue, cfg, editor);
+    hInstance = GetModuleHandleW(nullptr);
+    TERMINAL_SETTINGS_DIALOG settings(io, cfg, display, editor);
     display.Start();
     Type(editor, "ma");
     display.Redraw();
@@ -449,6 +500,20 @@ static int Preview(const std::wstring& path)
     send("[ERROR] connection timed out\r\n");
     send("[DEBUG] 中文日志，输入草稿与历史建议保持显示\r\n");
     boost::asio::steady_timer ticker(io);
+    TEST_BYTE_PIPE serialPipe;
+    boost::asio::serial_port serial(io);
+    serial.assign(serialPipe.TakeServer());
+    SERIAL_WRITE_QUEUE serialQueue(serial);
+    AUTOMATION_SERVER automation(io, cfg, serialQueue, display);
+    boost::asio::windows::stream_handle input(io,
+        CreateFileW(L"CONIN$", FILE_GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
+    GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode);
+    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), (mode | ENABLE_VIRTUAL_TERMINAL_INPUT) &
+        ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT));
+    std::vector<uint8_t> inputBuffer(1024);
+    DoConsoleToSerial(input, serialQueue, inputBuffer, cfg, display, editor, history, automation,
+        [&]() { settings.Open(); });
+    if (runtimeSettings) settings.Open(settingsParent);
     int count = 0;
     std::function<void()> tick = [&]()
     {
@@ -461,18 +526,172 @@ static int Preview(const std::wstring& path)
             else if (count % 7 == 0) send("[ERROR] simulated timeout\r\n");
             else send("[DEBUG] background log " + std::to_string(count) + "\r\n");
             if (count == 4) display.Sent(EncodeTerminalText(L"echo hello", CP_UTF8), false);
-            if (count < 120) tick(); else display.Stop();
+            if (count < (runtimeSettings ? 600 : 120) && (!runtimeSettings || settings.IsOpen())) tick();
+            else display.Stop();
         });
     };
     tick();
     io.run();
+    display.Cancel();
+    settings.Stop();
+    serialQueue.Stop();
+    queue.Stop();
+    input.cancel();
+    output.cancel();
+    serial.cancel();
+    ticker.cancel();
+    io.restart();
+    io.run();
+    if (runtimeSettings)
+    {
+        HKEY saved = nullptr;
+        auto settingsSaved = RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\SerialForWindowsTerminal", 0,
+                                           KEY_READ, &saved) == ERROR_SUCCESS;
+        if (saved) RegCloseKey(saved);
+        std::ofstream result(path + L".result.txt", std::ios::binary);
+        result << "encoding=" << cfg.EncodingFormat << "\nlocal=" << cfg.EchoMode
+               << "\ntimestamps=" << cfg.Timestamps << "\nsaved=" << settingsSaved
+               << "\nexit=" << g_shouldExit << "\nbackgroundLogs=" << count
+               << "\ndraft=" << Bytes(editor.Text()) << '\n';
+    }
     return 0;
+}
+
+static int WithIsolatedSettings(const std::function<int()>& run)
+{
+    // GUI 验证中的确定按钮只写入本进程临时注册表，不修改用户实际配置
+    const auto keyName = L"Software\\SerialTerminalSettingsTest-" + std::to_wstring(GetCurrentProcessId());
+    HKEY isolated = nullptr;
+    DWORD disposition = 0;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, keyName.c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_ALL_ACCESS,
+                        nullptr, &isolated, &disposition) != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY)
+        return 2;
+    if (RegOverridePredefKey(HKEY_CURRENT_USER, isolated) != ERROR_SUCCESS)
+    {
+        RegCloseKey(isolated);
+        return 2;
+    }
+    g_consoleCloseRequested = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_consoleMainThread,
+                    SYNCHRONIZE, FALSE, 0);
+    auto result = run();
+    RegOverridePredefKey(HKEY_CURRENT_USER, nullptr);
+    RegCloseKey(isolated);
+    RegDeleteTreeW(HKEY_CURRENT_USER, keyName.c_str());
+    return result;
+}
+
+static void TestRuntimeSettings(UINT action, bool unencodable = false)
+{
+    auto previousFailures = Failures;
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"SOFTWARE\\SerialForWindowsTerminal");
+    g_shouldExit = false;
+    hInstance = GetModuleHandleW(nullptr);
+    TEST_BYTE_PIPE outputPipe;
+    boost::asio::io_service io;
+    boost::asio::windows::stream_handle output(io, outputPipe.TakeServer());
+    CONSOLE_WRITE_QUEUE queue(output);
+    SERIAL_CONFIG cfg = {};
+    cfg.Serial = 4;
+    cfg.BaudRate = 115200;
+    cfg.EchoMode = 1;
+    cfg.Timestamps = 1;
+    COMMAND_HISTORY history;
+    LOCAL_LINE_EDITOR editor(history);
+    Type(editor, unencodable ? "draft \xf0\x9f\x98\x80" : "draft");
+    auto originalDraft = editor.Text();
+    TERMINAL_DISPLAY display(io, queue, cfg, editor);
+    TERMINAL_SETTINGS_DIALOG settings(io, cfg, display, editor);
+    settings.Open(nullptr);
+    HWND dialog = nullptr;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!dialog && std::chrono::steady_clock::now() < deadline)
+    {
+        EnumWindows([](HWND window, LPARAM context) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(window, &pid);
+            if (pid == GetCurrentProcessId() && GetDlgItem(window, IDC_BUTTON_EXIT_TERMINAL))
+            {
+                *reinterpret_cast<HWND*>(context) = window;
+                return FALSE;
+            }
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&dialog));
+        if (!dialog) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    Check(dialog != nullptr, "runtime settings creates its actual dialog");
+    if (dialog)
+    {
+        settings.Open(nullptr);
+        const std::string background = "background log while settings are open\r\n";
+        display.Receive(reinterpret_cast<const uint8_t*>(background.data()), background.size(), "[12:00:00.000] ");
+        io.run_for(std::chrono::milliseconds(20));
+        io.restart();
+        DWORD available = 0;
+        PeekNamedPipe(outputPipe.Client, nullptr, 0, nullptr, &available, nullptr);
+        std::string rendered(available, '\0');
+        DWORD read = 0;
+        if (available) ReadFile(outputPipe.Client, &rendered[0], available, &read, nullptr);
+        Check(rendered.find("background log while settings are open") != std::string::npos &&
+              settings.IsOpen() && !display.IsStopped(),
+              "terminal output continues while settings are open");
+        SendDlgItemMessageW(dialog, IDC_COMBO_ENCODING, CB_SETCURSEL, 1, 0);
+        SendDlgItemMessageW(dialog, IDC_COMBO_ECHO, CB_SETCURSEL, 0, 0);
+        CheckDlgButton(dialog, IDC_CHECK_TIMESTAMPS, BST_UNCHECKED);
+        if (action == WM_CLOSE)
+            SendMessageW(dialog, WM_CLOSE, 0, 0);
+        else if (action == 0)
+            settings.Stop();
+        else
+            SendMessageW(dialog, WM_COMMAND, action, 0);
+        deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+        while (settings.IsOpen() && std::chrono::steady_clock::now() < deadline)
+        {
+            io.run_for(std::chrono::milliseconds(10));
+            io.restart();
+            if (settings.IsOpen()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        Check(!settings.IsOpen(), "settings result returns to the terminal event loop");
+        const bool applied = action == IDOK && !unencodable;
+        Check(cfg.EncodingFormat == (applied ? 1u : 0u) && cfg.EchoMode == (applied ? 0u : 1u) &&
+              cfg.Timestamps == (applied ? 0u : 1u), "only a valid OK applies the selected settings");
+        HKEY saved = nullptr;
+        const bool persisted = RegOpenKeyExW(HKEY_CURRENT_USER, L"SOFTWARE\\SerialForWindowsTerminal", 0,
+                                             KEY_READ, &saved) == ERROR_SUCCESS;
+        if (saved) RegCloseKey(saved);
+        Check(persisted == applied, "cancel, close, exit and encoding rejection do not save settings");
+        if (persisted)
+        {
+            const auto stored = ReadSerialConfig();
+            Check(stored.EncodingFormat == 1 && stored.EchoMode == 0 && stored.Timestamps == 0,
+                  "OK saves all selected settings to the isolated registry");
+        }
+        Check(cfg.Serial == 4 && cfg.BaudRate == 115200 && editor.Text() == originalDraft,
+              "runtime settings preserves the serial connection and input draft");
+        Check(g_shouldExit == (action == IDC_BUTTON_EXIT_TERMINAL), "only Exit requests terminal shutdown");
+    }
+    settings.Stop();
+    display.Cancel();
+    queue.Stop();
+    output.cancel();
+    io.restart();
+    io.run();
+    if (Failures != previousFailures)
+        std::cerr << "Runtime settings action=" << action << " unencodable=" << unencodable
+                  << " encoding=" << cfg.EncodingFormat << " local=" << cfg.EchoMode
+                  << " timestamps=" << cfg.Timestamps << " exit=" << g_shouldExit << '\n';
 }
 
 int wmain(int argc, const wchar_t* argv[])
 {
-    if (argc < 2) { std::cerr << "Usage: TerminalInteractionTests.exe <isolated-history-path> [--preview | --settings]\n"; return 2; }
-    if (argc > 2 && std::wstring(argv[2]) == L"--preview") return Preview(argv[1]);
+    if (argc < 2) { std::cerr << "Usage: TerminalInteractionTests.exe <isolated-history-path> [--preview | --settings | --runtime-settings]\n"; return 2; }
+    if (argc > 2 && std::wstring(argv[2]) == L"--preview")
+        return WithIsolatedSettings([&]() { return Preview(argv[1]); });
+    if (argc > 2 && std::wstring(argv[2]) == L"--runtime-settings")
+        return WithIsolatedSettings([&]() {
+            auto parent = argc > 3 ? reinterpret_cast<HWND>(_wcstoui64(argv[3], nullptr, 0)) : nullptr;
+            return Preview(argv[1], true, parent);
+        });
     if (argc > 2 && std::wstring(argv[2]) == L"--settings")
     {
         hInstance = GetModuleHandleW(nullptr);
@@ -486,6 +705,8 @@ int wmain(int argc, const wchar_t* argv[])
     TestLocalSubmission(submissionHistory, "echo hi\r", "echo hi\r", "Enter writes one CR without an extra blank submission");
     TestLocalSubmission(submissionHistory, "echo hi\r\n", "echo hi\r", "CRLF console input submits the command only once");
     TestLocalSubmission(submissionHistory, "\r", "\r", "empty Enter writes one CR");
+    TestSettingsShortcut(true);
+    TestSettingsShortcut(false);
     TestEchoDisplay(true, false, false);
     TestEchoDisplay(false, false, false);
     TestEchoDisplay(true, true, false);
@@ -495,6 +716,15 @@ int wmain(int argc, const wchar_t* argv[])
     TestSerialTermination(true, false);
     TestSerialTermination(true, true);
     TestCancelledWrites();
+    Check(WithIsolatedSettings([&]() {
+        TestRuntimeSettings(IDOK);
+        TestRuntimeSettings(IDCANCEL);
+        TestRuntimeSettings(WM_CLOSE);
+        TestRuntimeSettings(IDC_BUTTON_EXIT_TERMINAL);
+        TestRuntimeSettings(IDOK, true);
+        TestRuntimeSettings(0);
+        return 0;
+    }) == 0, "runtime settings checks use an isolated registry");
     std::cout << Checks << " checks, " << Failures << " failures\n";
     return Failures ? 1 : 0;
 }

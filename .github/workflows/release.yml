@@ -89,6 +89,7 @@ jobs:
               Copy-Item -Path "$($package.Source)\SerialTerminalCtl.exe" -Destination $stagingDirectory
               Copy-Item -Path "README.md" -Destination $stagingDirectory
               Copy-Item -Path "LICENSE" -Destination $stagingDirectory
+              Copy-Item -Path "docs" -Destination $stagingDirectory -Recurse
               New-Item -ItemType Directory -Path "$stagingDirectory\images" -Force | Out-Null
               Copy-Item -Path "images\settings.png" -Destination "$stagingDirectory\images"
 
@@ -120,4 +121,4 @@ jobs:
           gh release create $env:GITHUB_REF_NAME $assets `
               --verify-tag `
               --title "SerialPortForWindowsTerminal $env:GITHUB_REF_NAME" `
-              --generate-notes
+              --notes-file "docs/release-notes/$env:GITHUB_REF_NAME.md"

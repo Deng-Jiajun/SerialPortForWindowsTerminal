@@ -559,18 +559,8 @@ INPUT_ACTION LOCAL_LINE_EDITOR::Feed(uint8_t byte, UINT codePage)
             return byte == '\t' ? Insert(L" ") : INPUT_ACTION::None;
         switch (byte)
         {
-        case 3:
-            Clear();
-            return INPUT_ACTION::Interrupt;
-        case 4:
-            if (Line.empty())
-                return INPUT_ACTION::EndOfFile;
-            if (Cursor < Line.size())
-            {
-                Edit();
-                Line.erase(Cursor, NextCharacter(Line, Cursor) - Cursor);
-            }
-            break;
+        case 11:
+            return INPUT_ACTION::OpenSettings;
         case 8:
         case 127:
             if (Cursor > 0)
@@ -584,37 +574,12 @@ INPUT_ACTION LOCAL_LINE_EDITOR::Feed(uint8_t byte, UINT codePage)
         case 5:
             Cursor = Line.size();
             break;
-        case 6:
-            if (Cursor == Line.size())
-                AcceptSuggestion();
-            else
-                Cursor = NextCharacter(Line, Cursor);
-            break;
         case 2:
             Cursor = PreviousCharacter(Line, Cursor);
             break;
         case 9:
             AcceptSuggestion();
             break;
-        case 11:
-            Edit();
-            Line.erase(Cursor);
-            break;
-        case 21:
-            Edit();
-            Line.erase(0, Cursor);
-            Cursor = 0;
-            break;
-        case 23: {
-            Edit();
-            auto end = Cursor;
-            while (Cursor > 0 && Line[Cursor - 1] == L' ')
-                Cursor = PreviousCharacter(Line, Cursor);
-            while (Cursor > 0 && Line[Cursor - 1] != L' ')
-                Cursor = PreviousCharacter(Line, Cursor);
-            Line.erase(Cursor, end - Cursor);
-            break;
-        }
         }
         return INPUT_ACTION::None;
     }

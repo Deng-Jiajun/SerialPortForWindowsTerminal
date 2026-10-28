@@ -28,8 +28,6 @@ HINSTANCE hInstance;
 INT_PTR CALLBACK    About(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK    SettingFunc(HWND, UINT, WPARAM, LPARAM);
 
-// 添加全局标志来跟踪Ctrl+A状态
-bool g_isCtrlAPressed = false;
 // 添加全局标志来控制程序退出
 bool g_shouldExit = false;
 
@@ -182,12 +180,13 @@ static void UpdatePortControl(HWND hDlg)
     }
 }
 
-static void CenterParentWindow(HWND hWnd)
+static void CenterParentWindow(HWND hWnd, HWND hWndParent = nullptr)
 {
     RECT rcDlg;
     ::GetWindowRect(hWnd, &rcDlg);
     RECT rcParent;
-    HWND hWndParent = GetParent(hWnd);
+    if (hWndParent == nullptr)
+        hWndParent = GetParent(hWnd);
     GetClientRect(hWndParent, &rcParent);
     POINT ptParentInScreen;
     ptParentInScreen.x = rcParent.left;
@@ -1327,8 +1326,6 @@ private:
             break;
         }
 
-        g_isCtrlAPressed = false;
-
         WriteQueue.Enqueue(
             std::move(command),
             [this, requestId, encodingFormat, prompt = std::move(prompt), displayCommand = std::move(displayCommand)]() mutable
@@ -1397,6 +1394,154 @@ private:
     std::chrono::steady_clock::time_point LastDataTime;
 };
 
+class TERMINAL_SETTINGS_DIALOG
+{
+  public:
+    TERMINAL_SETTINGS_DIALOG(boost::asio::io_service &ioctx, SERIAL_CONFIG &config, TERMINAL_DISPLAY &display,
+                             LOCAL_LINE_EDITOR &editor)
+        : IoContext(ioctx), Config(config), Display(display), Editor(editor) {}
+
+    ~TERMINAL_SETTINGS_DIALOG() { Stop(); }
+
+    bool IsOpen() const { return Opened; }
+
+    void Open(HWND parent = GetForegroundWindow())
+    {
+        if (Stopping.load())
+            return;
+        if (Opened)
+        {
+            if (auto window = Window.load())
+                SetForegroundWindow(window);
+            return;
+        }
+        if (Worker.joinable())
+            Worker.join();
+        Opened = true;
+        auto config = Config;
+        // 模态窗口使用独立消息线程，串口接收和输入草稿仍由原 I/O 线程管理
+        Worker = std::thread([this, config, parent]() {
+            REQUEST request = {this, config, parent};
+            auto result = DialogBoxParamW(hInstance, MAKEINTRESOURCEW(IDD_TERMINAL_SETTINGS), nullptr, DialogProc,
+                                          reinterpret_cast<LPARAM>(&request));
+            DWORD error = result == -1 ? GetLastError() : ERROR_SUCCESS;
+            Window.store(nullptr);
+            auto handlerReady = RegisterConsoleControlHandler();
+            if (!handlerReady)
+                error = GetLastError();
+            IoContext.post([this, result, error, handlerReady, selected = request.Config]() {
+                Opened = false;
+                if (Stopping.load() || Display.IsStopped())
+                    return;
+                if (error)
+                {
+                    boost::system::error_code ec(error, boost::system::system_category());
+                    Display.Message("[Error] Terminal settings: " + ErrorMessage(ec, Display.CodePage()));
+                    if (!handlerReady)
+                        Display.Stop(ec);
+                    return;
+                }
+                if (result == IDC_BUTTON_EXIT_TERMINAL)
+                {
+                    g_shouldExit = true;
+                    Display.Stop();
+                }
+                else if (result == IDOK)
+                {
+                    auto codePage = selected.EncodingFormat == 0 ? CP_UTF8 : 936;
+                    if (!Editor.Text().empty() && EncodeTerminalText(Editor.Text(), codePage).empty())
+                    {
+                        Display.Message("[Error] Input cannot be represented in the selected encoding; settings unchanged, draft kept");
+                        return;
+                    }
+                    auto next = Config;
+                    next.EncodingFormat = selected.EncodingFormat;
+                    next.EchoMode = selected.EchoMode;
+                    next.Timestamps = selected.Timestamps;
+                    Display.Configure(next);
+                    WriteSerialConfig(Config);
+                    Display.Message("Terminal settings updated");
+                }
+            });
+        });
+    }
+
+    void Stop()
+    {
+        Stopping.store(true);
+        if (auto window = Window.load())
+            PostMessageW(window, WM_CLOSE, 0, 0);
+        if (Worker.joinable())
+            Worker.join();
+    }
+
+  private:
+    struct REQUEST
+    {
+        TERMINAL_SETTINGS_DIALOG *Owner;
+        SERIAL_CONFIG Config;
+        HWND Parent;
+    };
+
+    static INT_PTR CALLBACK DialogProc(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        auto request = reinterpret_cast<REQUEST *>(GetWindowLongPtrW(dialog, GWLP_USERDATA));
+        if (message == WM_INITDIALOG)
+        {
+            request = reinterpret_cast<REQUEST *>(lParam);
+            SetWindowLongPtrW(dialog, GWLP_USERDATA, lParam);
+            request->Owner->Window.store(dialog);
+            if (request->Owner->Stopping.load())
+            {
+                EndDialog(dialog, IDCANCEL);
+                return TRUE;
+            }
+            if (request->Parent)
+                CenterParentWindow(dialog, request->Parent);
+            auto encoding = GetDlgItem(dialog, IDC_COMBO_ENCODING);
+            ComboBox_AddString(encoding, L"UTF-8");
+            ComboBox_AddString(encoding, L"GBK");
+            ComboBox_SetCurSel(encoding, request->Config.EncodingFormat);
+            auto input = GetDlgItem(dialog, IDC_COMBO_ECHO);
+            ComboBox_AddString(input, L"字符透传");
+            ComboBox_AddString(input, L"本地编辑（历史建议）");
+            ComboBox_SetCurSel(input, request->Config.EchoMode);
+            CheckDlgButton(dialog, IDC_CHECK_TIMESTAMPS, request->Config.Timestamps ? BST_CHECKED : BST_UNCHECKED);
+            return TRUE;
+        }
+        if (message == WM_CLOSE)
+        {
+            EndDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        if (message == WM_COMMAND && request)
+        {
+            auto command = LOWORD(wParam);
+            if (command == IDOK)
+            {
+                request->Config.EncodingFormat = ComboBox_GetCurSel(GetDlgItem(dialog, IDC_COMBO_ENCODING));
+                request->Config.EchoMode = ComboBox_GetCurSel(GetDlgItem(dialog, IDC_COMBO_ECHO));
+                request->Config.Timestamps = IsDlgButtonChecked(dialog, IDC_CHECK_TIMESTAMPS) == BST_CHECKED;
+            }
+            if (command == IDOK || command == IDCANCEL || command == IDC_BUTTON_EXIT_TERMINAL)
+            {
+                EndDialog(dialog, command);
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
+    boost::asio::io_service &IoContext;
+    SERIAL_CONFIG &Config;
+    TERMINAL_DISPLAY &Display;
+    LOCAL_LINE_EDITOR &Editor;
+    std::thread Worker;
+    std::atomic<HWND> Window{nullptr};
+    std::atomic<bool> Stopping{false};
+    bool Opened = false;
+};
+
 static void DoSerialToConsole(boost::asio::serial_port &serialPort, std::vector<uint8_t> &buffer,
                               TERMINAL_DISPLAY &display, AUTOMATION_SERVER &automationServer)
 {
@@ -1421,10 +1566,11 @@ static void DoSerialToConsole(boost::asio::serial_port &serialPort, std::vector<
 
 static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput, SERIAL_WRITE_QUEUE &writeQueue,
                               std::vector<uint8_t> &buffer, SERIAL_CONFIG &cfg, TERMINAL_DISPLAY &display,
-                              LOCAL_LINE_EDITOR &editor, COMMAND_HISTORY &history, AUTOMATION_SERVER &automationServer)
+                              LOCAL_LINE_EDITOR &editor, COMMAND_HISTORY &history, AUTOMATION_SERVER &automationServer,
+                              std::function<void()> openSettings)
 {
     consoleInput.async_read_some(boost::asio::buffer(buffer), [&consoleInput, &writeQueue, &buffer, &cfg, &display,
-                                                               &editor, &history, &automationServer](
+                                                               &editor, &history, &automationServer, openSettings](
                                                                   const boost::system::error_code &ec, size_t size) {
         if (display.IsStopped())
             return;
@@ -1446,61 +1592,13 @@ static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput,
         for (size_t i = 0; i < size; ++i)
         {
             auto byte = buffer[i];
-            if (g_isCtrlAPressed)
+            if (byte == 11)
             {
-                g_isCtrlAPressed = false;
-                flushRaw();
-                auto next = cfg;
-                if (byte == 24)
+                if (cfg.EchoMode == 0 || editor.Feed(byte, display.CodePage()) == INPUT_ACTION::OpenSettings)
                 {
-                    auto answer = MessageBoxW(nullptr, L"确定要退出程序吗？", L"退出确认", MB_YESNO | MB_ICONQUESTION);
-                    if (!RegisterConsoleControlHandler())
-                    {
-                        boost::system::error_code error(GetLastError(), boost::system::system_category());
-                        display.Message("[Error] Console close handler: " + ErrorMessage(error, display.CodePage()));
-                        display.Stop(error);
-                        return;
-                    }
-                    if (answer == IDYES)
-                    {
-                        g_shouldExit = true;
-                        consoleInput.cancel();
-                        display.Stop();
-                        return;
-                    }
+                    flushRaw();
+                    openSettings();
                 }
-                else if (byte == 3)
-                {
-                    next.EncodingFormat = cfg.EncodingFormat == 0 ? 1 : 0;
-                    auto codePage = next.EncodingFormat == 0 ? CP_UTF8 : 936;
-                    if (!editor.Text().empty() && EncodeTerminalText(editor.Text(), codePage).empty())
-                    {
-                        display.Message("[Error] Input cannot be represented in the selected encoding; draft kept");
-                        continue;
-                    }
-                    display.Configure(next);
-                    WriteSerialConfig(cfg);
-                    display.Message(std::string("Encoding: ") + (cfg.EncodingFormat == 0 ? "UTF-8" : "GBK"));
-                }
-                else if (byte == 5)
-                {
-                    next.EchoMode = cfg.EchoMode == 0 ? 1 : 0;
-                    display.Configure(next);
-                    WriteSerialConfig(cfg);
-                    display.Message(cfg.EchoMode ? "Input: local editor (history enabled)" : "Input: raw passthrough");
-                }
-                else if (byte == 20)
-                {
-                    next.Timestamps = cfg.Timestamps ? 0 : 1;
-                    display.Configure(next);
-                    WriteSerialConfig(cfg);
-                    display.Message(cfg.Timestamps ? "Timestamps: on" : "Timestamps: off");
-                }
-                continue;
-            }
-            if (byte == 1)
-            {
-                g_isCtrlAPressed = true;
                 continue;
             }
             if (automationServer.IsCommandActive())
@@ -1548,8 +1646,6 @@ static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput,
                         display.Redraw();
                     });
             }
-            else if (action == INPUT_ACTION::Interrupt || action == INPUT_ACTION::EndOfFile)
-                writeQueue.Enqueue({static_cast<uint8_t>(action == INPUT_ACTION::Interrupt ? 3 : 4)});
             else if (action == INPUT_ACTION::Rejected)
                 display.Message("[Error] Input rejected: invalid character or command longer than 4096 characters");
         }
@@ -1557,7 +1653,7 @@ static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput,
         if (ignored)
             display.Message("[External] Command is running; keyboard input ignored");
         display.Redraw();
-        DoConsoleToSerial(consoleInput, writeQueue, buffer, cfg, display, editor, history, automationServer);
+        DoConsoleToSerial(consoleInput, writeQueue, buffer, cfg, display, editor, history, automationServer, openSettings);
     });
 }
 
@@ -1601,20 +1697,17 @@ static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::a
     LOCAL_LINE_EDITOR editor(history);
     TERMINAL_DISPLAY display(ioctx, consoleWriteQueue, cfg, editor);
     AUTOMATION_SERVER automationServer(ioctx, cfg, writeQueue, display);
-    if (automationServer.Start())
-    {
-        std::cout << "\033[32mExternal control: \\.\\pipe\\SerialForWindowsTerminal\033[39m" << std::endl;
-        std::cout << "\033[33mUse .\\SerialTerminalCtl.exe exec --line-ending cr \"ls\"\033[39m" << std::endl;
-    }
-    else
+    if (!automationServer.Start())
     {
         std::cout << "\033[93mExternal control unavailable; another terminal may own the pipe\033[39m" << std::endl;
     }
 
+    TERMINAL_SETTINGS_DIALOG settings(ioctx, cfg, display, editor);
     display.Start();
     if (historyError) display.Message("[Error] Cannot load history (Windows error " + std::to_string(historyError) + ")");
     DoSerialToConsole(serialPort, serialPortRecvBuffer, display, automationServer);
-    DoConsoleToSerial(stdinput, writeQueue, serialPortSendBuffer, cfg, display, editor, history, automationServer);
+    DoConsoleToSerial(stdinput, writeQueue, serialPortSendBuffer, cfg, display, editor, history, automationServer,
+                      [&settings]() { settings.Open(); });
 
     // 重置退出标志
     g_shouldExit = false;
@@ -1622,6 +1715,7 @@ static boost::system::error_code DoWork(boost::asio::io_service& ioctx, boost::a
     ioctx.run(ec);
     cleaningUp = true;
     display.Cancel();
+    settings.Stop();
     writeQueue.Stop();
     consoleWriteQueue.Stop();
     boost::system::error_code ignored;
@@ -1713,13 +1807,10 @@ int wmain(int argc, const WCHAR* args[])
                 }
 
                     // 显示当前编码格式
-                    std::cout << "\033[36mVersion: v1.0.0\033[0m" << std::endl;
+                    std::cout << "\033[36mVersion: v1.1.0\033[0m" << std::endl;
                     std::cout << "\033[32mConsole encoding: " << (cfg.EncodingFormat == 0 ? "UTF-8" : "GBK") << "\033[0m" << std::endl;
                     std::cout << "\033[32mInput: " << (cfg.EchoMode == 0 ? "raw passthrough" : "local editor (history enabled)") << "\033[0m" << std::endl;
-                    std::cout << "\033[33mPress Ctrl+A then Ctrl+C to toggle encoding format\033[0m" << std::endl;
-                    std::cout << "\033[33mPress Ctrl+A then Ctrl+E to toggle raw/local input\033[0m" << std::endl;
-                    std::cout << "\033[33mPress Ctrl+A then Ctrl+T to toggle timestamps\033[0m" << std::endl;
-                    std::cout << "\033[33mPress Ctrl+A then Ctrl+X to exit\033[0m" << std::endl;
+                    std::cout << "\033[33mPress Ctrl+K to open terminal settings\033[0m" << std::endl;
 
                     // 运行工作循环，传递配置
                     ec = DoWork(ioctx, serialPort, cfg);

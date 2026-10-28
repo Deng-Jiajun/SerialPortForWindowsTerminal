@@ -66,8 +66,7 @@ enum class INPUT_ACTION
 {
     None,
     Submit,
-    Interrupt,
-    EndOfFile,
+    OpenSettings,
     Rejected
 };
 
