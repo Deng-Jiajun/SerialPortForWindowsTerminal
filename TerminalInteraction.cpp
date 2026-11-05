@@ -489,10 +489,15 @@ void LOCAL_LINE_EDITOR::Browse(bool older)
 INPUT_ACTION LOCAL_LINE_EDITOR::Feed(uint8_t byte, UINT codePage)
 {
     CodePage = codePage;
+    // 新 Esc 可重新开始转义，避免不完整的粘贴内容吞掉粘贴结束标记
+    // 裸 Esc 与 Alt 组合键共用前缀；只限制裸前缀的等待时间，不给已开始的 CSI/SS3 或粘贴计时
+    if (!Escape.empty() && (byte == '\033' || (!Pasting &&
+        (byte < 32 || byte == 127 || (Escape.size() == 1 && GetTickCount64() - EscapeStarted >= 100)))))
+        Escape.clear();
     if (!Escape.empty())
     {
         Escape += static_cast<char>(byte);
-        if (!EscapeFinished(Escape) && Escape.size() < 64)
+        if (Escape == "\033O" || (!EscapeFinished(Escape) && Escape.size() < 64))
             return INPUT_ACTION::None;
         auto key = Escape;
         Escape.clear();
@@ -535,6 +540,7 @@ INPUT_ACTION LOCAL_LINE_EDITOR::Feed(uint8_t byte, UINT codePage)
     if (Character.empty() && byte == '\033')
     {
         Escape = "\033";
+        EscapeStarted = GetTickCount64();
         PreviousCR = false;
         return INPUT_ACTION::None;
     }
@@ -559,6 +565,9 @@ INPUT_ACTION LOCAL_LINE_EDITOR::Feed(uint8_t byte, UINT codePage)
             return byte == '\t' ? Insert(L" ") : INPUT_ACTION::None;
         switch (byte)
         {
+        case 3:
+            Clear();
+            return INPUT_ACTION::Interrupt;
         case 11:
             return INPUT_ACTION::OpenSettings;
         case 8:

@@ -1646,6 +1646,11 @@ static void DoConsoleToSerial(boost::asio::windows::stream_handle &consoleInput,
                         display.Redraw();
                     });
             }
+            else if (action == INPUT_ACTION::Interrupt)
+                writeQueue.Enqueue({3}, [&display]() {
+                    display.Sent({'^', 'C'}, false);
+                    return true;
+                });
             else if (action == INPUT_ACTION::Rejected)
                 display.Message("[Error] Input rejected: invalid character or command longer than 4096 characters");
         }
@@ -1807,7 +1812,7 @@ int wmain(int argc, const WCHAR* args[])
                 }
 
                     // 显示当前编码格式
-                    std::cout << "\033[36mVersion: v1.1.0\033[0m" << std::endl;
+                    std::cout << "\033[36mVersion: v1.1.1\033[0m" << std::endl;
                     std::cout << "\033[32mConsole encoding: " << (cfg.EncodingFormat == 0 ? "UTF-8" : "GBK") << "\033[0m" << std::endl;
                     std::cout << "\033[32mInput: " << (cfg.EchoMode == 0 ? "raw passthrough" : "local editor (history enabled)") << "\033[0m" << std::endl;
                     std::cout << "\033[33mPress Ctrl+K to open terminal settings\033[0m" << std::endl;

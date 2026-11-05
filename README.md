@@ -2,7 +2,7 @@
 
 在 Windows Terminal 中连接串口，支持 UTF-8 / GBK、关键词高亮、日志时间戳和本地命令历史。
 
-[下载最新版](https://github.com/Deng-Jiajun/SerialPortForWindowsTerminal/releases/latest) · [v1.1.0 更新说明](docs/release-notes/v1.1.0.md)
+[下载最新版](https://github.com/Deng-Jiajun/SerialPortForWindowsTerminal/releases/latest) · [v1.1.1 更新说明](docs/release-notes/v1.1.1.md)
 
 ## 下载与连接
 
@@ -21,11 +21,12 @@
 
 **本地编辑（历史建议）**适合输入命令、查看日志。输入行固定在底部，按回车后整行发送，上方日志持续滚动；输入前缀匹配历史命令时，剩余内容以灰色显示。
 
-**字符透传**适合登录密码、`vim`、`top` 等直接交互。使用这些功能时关闭时间戳；需要向设备发送 `Ctrl+C` 中断或 `Ctrl+D` EOF 时，也先切换到此模式。
+**字符透传**适合登录密码、`vim`、`top` 等直接交互。使用这些功能时关闭时间戳；需要向设备发送 `Ctrl+D` EOF 时，也先切换到此模式。
 
 | 按键 | 操作 |
 | --- | --- |
 | `Ctrl+K` | 打开「终端设置」，两种输入模式均可使用 |
+| `Ctrl+C` | 本地编辑时取消草稿，立即发送中断字节 `0x03`，显示青色 `> ^C` 记录，无需回车 |
 | `Enter` | 本地编辑时发送当前命令，末尾只追加一个 `CR`（`\r`） |
 | `→` | 本地编辑时，光标在行末则接受灰色建议，否则向右移动 |
 | `Tab` | 接受历史建议，不查询设备文件或补全设备命令 |
@@ -35,7 +36,7 @@
 
 「终端设置」可修改编码、输入模式和时间戳，也可退出终端。弹窗打开期间继续接收日志并保留草稿；「确定」应用并保存，「取消」或关闭弹窗不修改设置。串口号、波特率和关键词高亮仍在连接前配置。
 
-本地编辑不处理 `Ctrl+F`、`Ctrl+U`、`Ctrl+W`、`Ctrl+C`、`Ctrl+D`；字符透传中除 `Ctrl+K` 外，其余按键原样发送。
+本地编辑不处理 `Ctrl+F`、`Ctrl+U`、`Ctrl+W`、`Ctrl+D`；字符透传中除 `Ctrl+K` 外，其余按键原样发送。
 
 ## 日志显示
 
@@ -60,6 +61,7 @@
 - [输入、历史与日志](docs/terminal.md)：草稿、编码切换、历史保存、时间戳和回显过滤规则
 - [外部命令控制](docs/automation.md)：通过 `SerialTerminalCtl.exe` 发送命令并读取响应
 - [构建、测试与发布](docs/development.md)：开发环境、验证命令和发布步骤
+- [v1.1.1 更新说明](docs/release-notes/v1.1.1.md)
 - [v1.1.0 更新说明](docs/release-notes/v1.1.0.md)
 
 本项目基于 [Zhou-zhi-peng/SerialPortForWindowsTerminal](https://github.com/Zhou-zhi-peng/SerialPortForWindowsTerminal)，使用 [Apache-2.0 许可证](LICENSE)。

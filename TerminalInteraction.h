@@ -66,6 +66,7 @@ enum class INPUT_ACTION
 {
     None,
     Submit,
+    Interrupt,
     OpenSettings,
     Rejected
 };
@@ -105,5 +106,6 @@ class LOCAL_LINE_EDITOR
     size_t CharacterSize = 0;
     bool PreviousCR = false;
     bool Pasting = false;
+    ULONGLONG EscapeStarted = 0;
     UINT CodePage = CP_UTF8;
 };

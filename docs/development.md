@@ -14,7 +14,7 @@ New-Item -ItemType Directory -Path $testDirectory | Out-Null
 .\artifacts\tests\x64\TerminalInteractionTests.exe (Join-Path $testDirectory 'history.txt')
 ```
 
-自动检查覆盖串口分包、换行、UTF-8/GBK、ANSI 颜色、关键词高亮、历史恢复与并发保存、灰色建议、草稿恢复、中文编辑及粘贴。回车和 `Ctrl+K` 检查以字节管道代替串口，经过实际输入处理和发送队列，确认命令与空行均只发送一个 `CR`，设置快捷键不发送给设备，已移除的本地快捷键不改变草稿。设置检查向实际弹窗发送控件消息，验证确定、取消、关闭、退出、草稿编码拒绝及弹窗打开期间的日志输出。断开检查覆盖错误提示、非零错误状态、主动取消与排队写入取消。
+自动检查覆盖串口分包、换行、UTF-8/GBK、ANSI 颜色、关键词高亮、历史恢复与并发保存、灰色建议、草稿恢复、中文编辑及粘贴。回车、`Ctrl+C` 和 `Ctrl+K` 检查以字节管道代替串口，经过实际输入处理和发送队列，确认命令与空行均只发送一个 `CR`，设置快捷键不发送给设备，已移除的本地快捷键不改变草稿。`Ctrl+C` 检查还覆盖单字节中断发送、草稿取消、青色发送记录、时间戳和分包回显过滤。转义输入检查覆盖 `Esc` 超时、SS3 导航和不完整粘贴转义后的正常输入恢复。设置检查向实际弹窗发送控件消息，验证确定、取消、关闭、退出、草稿编码拒绝及弹窗打开期间的日志输出。断开检查覆盖错误提示、非零错误状态、主动取消与排队写入取消。
 
 测试使用独立历史文件和本进程临时注册表，不访问实际设备。测试程序的 `--preview` 参数显示持续模拟日志和输入建议；`--runtime-settings` 同时打开「终端设置」，供 GUI 验证使用。
 
@@ -38,8 +38,8 @@ GitHub Actions 在 `main` 推送及 Pull Request 时构建 Debug / Release、x86
 4. 为该提交创建版本标签并推送，例如：
 
 ```powershell
-git tag -a v1.1.0 -m "SerialPortForWindowsTerminal v1.1.0"
-git push origin v1.1.0
+git tag -a v1.1.1 -m "SerialPortForWindowsTerminal v1.1.1"
+git push origin v1.1.1
 ```
 
 发布流程使用对应标签的说明文件创建 Release。每个 ZIP 包含主程序、控制程序、README、`docs`、设置截图和许可证；`SHA256SUMS.txt` 提供两个 ZIP 的 SHA-256。发布后检查 Actions 结果及 Release 附件。

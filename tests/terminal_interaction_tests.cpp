@@ -179,12 +179,16 @@ static void TestHistoryAndInput(const std::wstring& path)
     editor.Clear();
     Check(editor.Feed('\n', CP_UTF8) == INPUT_ACTION::None, "CRLF not double submitted after clearing");
     Type(editor, "echo");
-    for (auto key : {3, 4, 6, 21, 23})
+    for (auto key : {4, 6, 21, 23})
         Check(editor.Feed(static_cast<uint8_t>(key), CP_UTF8) == INPUT_ACTION::None && editor.Text() == L"echo",
               "removed local control shortcuts preserve the draft");
     Check(editor.Feed(11, CP_UTF8) == INPUT_ACTION::OpenSettings && editor.Text() == L"echo",
           "Ctrl+K opens settings without deleting the draft");
+    Check(editor.Feed(3, CP_UTF8) == INPUT_ACTION::Interrupt && editor.Text().empty() && editor.Position() == 0,
+          "Ctrl+C cancels the local draft and requests a serial interrupt");
+    Check(editor.Feed(3, CP_UTF8) == INPUT_ACTION::Interrupt, "Ctrl+C interrupts even with an empty draft");
     Type(editor, "\033[200~");
+    Check(editor.Feed(3, CP_UTF8) == INPUT_ACTION::None, "pasted Ctrl+C never interrupts the device");
     Check(editor.Feed(11, CP_UTF8) == INPUT_ACTION::None, "pasted Ctrl+K does not open settings");
     Type(editor, "\033[201~");
     editor.Clear();
@@ -227,6 +231,72 @@ static void TestHistoryAndInput(const std::wstring& path)
     { std::ifstream file(damagedPath, std::ios::binary); std::string contents((std::istreambuf_iterator<char>(file)), {}); Check(contents == "\xff\xfe\x80", "damaged original preserved"); }
 }
 
+static void TestEscapeInput(const std::wstring& path)
+{
+    COMMAND_HISTORY history;
+    Check(history.Load(path) == 0 && history.Remember(L"abc history") == 0, "escape tests use isolated history");
+    LOCAL_LINE_EDITOR editor(history);
+    const std::string keys[] = {"\033OD", "\033OC", "\033OH", "\033OF"};
+    const size_t positions[] = {2, 3, 0, 3};
+    for (size_t i = 0; i < 4; ++i)
+    {
+        editor.Clear();
+        Type(editor, "abc");
+        if (i == 1) Type(editor, "\033[D");
+        Type(editor, keys[i]);
+        Check(editor.Text() == L"abc" && editor.Position() == positions[i], "SS3 navigation consumes the complete key sequence");
+    }
+    editor.Clear();
+    Type(editor, "ab\033OA");
+    Check(editor.Text() == L"abc history", "SS3 up selects history");
+    Type(editor, "\033OB");
+    Check(editor.Text() == L"ab", "SS3 down restores the draft");
+    for (auto prefix : {"\033[", "\033O"})
+    {
+        editor.Clear();
+        Type(editor, "abc");
+        Type(editor, prefix);
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        Type(editor, "DX");
+        Check(editor.Text() == L"abXc", "started CSI and SS3 survive delayed final bytes");
+    }
+    for (int delay : {0, 120})
+    {
+        for (auto key : {3, 11, 13})
+        {
+            editor.Clear();
+            Type(editor, "draft\033");
+            if (delay) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            auto action = editor.Feed(static_cast<uint8_t>(key), CP_UTF8);
+            Check(action == (key == 3 ? INPUT_ACTION::Interrupt : key == 11 ? INPUT_ACTION::OpenSettings : INPUT_ACTION::Submit),
+                "Esc never consumes Ctrl+C, Ctrl+K or Enter");
+        }
+    }
+    editor.Clear();
+    Type(editor, "\033x");
+    Check(editor.Text().empty(), "immediate unsupported Alt+character remains ignored");
+    Type(editor, "\033");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    Type(editor, "x");
+    Check(editor.Text() == L"x", "ordinary text after standalone Esc is retained");
+    editor.Clear();
+    Type(editor, "abc\033\033[DZ");
+    Check(editor.Text() == L"abZc", "repeated Esc starts a fresh key sequence");
+    editor.Clear();
+    Type(editor, "\033[200~a\033");
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    Check(editor.Feed(3, CP_UTF8) == INPUT_ACTION::None && editor.Feed(11, CP_UTF8) == INPUT_ACTION::None,
+        "pending Esc inside paste never enables interrupt or settings");
+    Type(editor, "b\033[201~");
+    Check(editor.Text() == L"ab", "paste end still restores normal input after an embedded escape");
+    editor.Clear();
+    Type(editor, "\033[200~a\033O\033[201~");
+    Check(editor.Text() == L"a", "incomplete pasted SS3 does not consume the paste end marker");
+    Check(editor.Feed(13, CP_UTF8) == INPUT_ACTION::Submit, "Enter submits after incomplete pasted SS3");
+    Check(editor.Feed(3, CP_UTF8) == INPUT_ACTION::Interrupt, "Ctrl+C resumes after incomplete pasted SS3");
+    Check(editor.Feed(11, CP_UTF8) == INPUT_ACTION::OpenSettings, "Ctrl+K resumes after incomplete pasted SS3");
+}
+
 // 用字节管道代替串口，经过生产输入处理和异步写队列检查实际发送内容
 struct TEST_BYTE_PIPE
 {
@@ -258,8 +328,9 @@ struct TEST_BYTE_PIPE
     }
 };
 
-static void TestLocalSubmission(const std::wstring& historyPath, const std::string& keys,
-    const std::string& expected, const char* name)
+static std::string TestLocalSubmission(const std::wstring& historyPath, const std::string& keys,
+    const std::string& expected, const char* name, bool timestamps = false,
+    const std::vector<std::string>& replies = {})
 {
     TEST_BYTE_PIPE inputPipe, serialPipe, outputPipe;
     boost::asio::io_service io;
@@ -271,6 +342,7 @@ static void TestLocalSubmission(const std::wstring& historyPath, const std::stri
     CONSOLE_WRITE_QUEUE outputQueue(output);
     SERIAL_CONFIG cfg = {};
     cfg.EchoMode = 1;
+    cfg.Timestamps = timestamps;
     COMMAND_HISTORY history;
     history.Load(historyPath);
     LOCAL_LINE_EDITOR editor(history);
@@ -291,6 +363,18 @@ static void TestLocalSubmission(const std::wstring& historyPath, const std::stri
         throw std::runtime_error("cannot read test serial output");
     sent.resize(received);
     Check(sent == expected, name);
+    for (const auto& reply : replies)
+        display.Receive(reinterpret_cast<const uint8_t*>(reply.data()), reply.size(), "[received] ");
+    io.restart();
+    io.run_for(std::chrono::milliseconds(20));
+    if (!PeekNamedPipe(outputPipe.Client, nullptr, 0, nullptr, &available, nullptr))
+        throw std::runtime_error("cannot inspect test display output");
+    std::string displayed(available, '\0');
+    received = 0;
+    if (available && !ReadFile(outputPipe.Client, &displayed[0], available, &received, nullptr))
+        throw std::runtime_error("cannot read test display output");
+    displayed.resize(received);
+    return displayed;
 }
 
 static void TestSettingsShortcut(bool local)
@@ -310,8 +394,8 @@ static void TestSettingsShortcut(bool local)
     Type(editor, "draft");
     TERMINAL_DISPLAY display(io, outputQueue, cfg, editor);
     AUTOMATION_SERVER automation(io, cfg, serialQueue, display);
-    const std::string controls = "\x01\x03\x04\x06\x15\x17";
-    const std::string keys = "\x0b" + controls + "x";
+    const std::string controls = "\x01\x04\x06\x15\x17";
+    const std::string keys = std::string(local ? "\033\x0b" : "\x0b") + controls + "x";
     DWORD written = 0;
     if (!WriteFile(inputPipe.Client, keys.data(), static_cast<DWORD>(keys.size()), &written, nullptr))
         throw std::runtime_error("cannot write settings shortcut test input");
@@ -701,10 +785,54 @@ int wmain(int argc, const wchar_t* argv[])
     TestEchoFilter();
     TestReceive();
     TestHistoryAndInput(argv[1]);
+    TestEscapeInput(std::wstring(argv[1]) + L".escape");
     auto submissionHistory = std::wstring(argv[1]) + L".submission";
     TestLocalSubmission(submissionHistory, "echo hi\r", "echo hi\r", "Enter writes one CR without an extra blank submission");
     TestLocalSubmission(submissionHistory, "echo hi\r\n", "echo hi\r", "CRLF console input submits the command only once");
     TestLocalSubmission(submissionHistory, "\r", "\r", "empty Enter writes one CR");
+    const std::string interruptRecord = "\033[96m> ^C\033[39m\r\n";
+    auto interruptOutput = TestLocalSubmission(submissionHistory, "\x03", "\x03",
+        "empty-draft Ctrl+C writes exactly one ETX without CR");
+    Check(interruptOutput == "\r\n" + interruptRecord, "Ctrl+C creates one cyan local send record without device echo");
+    const std::string interruptResult = "--- ping statistics ---\r\n1 transmitted, 1 received\r\n/ # ";
+    const std::string interruptReply = "^C\r\n" + interruptResult + "\r\n^C\r\n";
+    for (size_t split = 0; split <= 4; ++split)
+    {
+        auto displayed = TestLocalSubmission(submissionHistory, "\x03", "\x03",
+            "Ctrl+C echo filtering keeps the serial payload at one ETX", false,
+            {interruptReply.substr(0, split), interruptReply.substr(split)});
+        Check(displayed == "\r\n" + interruptRecord + interruptResult + "\r\n^C\r\n",
+            "Ctrl+C hides only its first device echo across packet boundaries and preserves later output");
+    }
+    for (const auto& reply : {interruptResult, std::string("^CPU status\r\n^C\r\n/ # ")})
+    {
+        auto displayed = TestLocalSubmission(submissionHistory, "\x03", "\x03",
+            "Ctrl+C sends ETX when the device has no matching echo", false, {reply});
+        Check(displayed == "\r\n" + interruptRecord + reply,
+            "Ctrl+C preserves statistics without echo and mismatching received text");
+    }
+    auto timedInterruptOutput = TestLocalSubmission(submissionHistory, "\x03", "\x03",
+        "timestamped Ctrl+C still writes exactly one ETX", true);
+    Check(timedInterruptOutput.find("\r\n[") == 0 &&
+        timedInterruptOutput.find("] " + interruptRecord) != std::string::npos,
+        "Ctrl+C send record follows the timestamp setting");
+    TestLocalSubmission(submissionHistory, "unfinished\x03" "next\r", "\x03" "next\r",
+        "Ctrl+C discards the draft without sending it and accepts the next command");
+    auto orderedOutput = TestLocalSubmission(submissionHistory, "first\r\x03" "second\r", "first\r\x03" "second\r",
+        "Ctrl+C stays in order between submitted commands");
+    auto firstRecord = orderedOutput.find("\033[96m> first");
+    auto interruptPosition = orderedOutput.find(interruptRecord);
+    auto secondRecord = orderedOutput.find("\033[96m> second");
+    Check(firstRecord != std::string::npos && interruptPosition != std::string::npos &&
+        secondRecord != std::string::npos && firstRecord < interruptPosition && interruptPosition < secondRecord,
+        "Ctrl+C send record follows serial queue order");
+    auto pastedOutput = TestLocalSubmission(submissionHistory, "\033[200~before\x03" "after\033[201~\r", "beforeafter\r",
+        "pasted ETX is ignored rather than sent to the device");
+    Check(pastedOutput.find(interruptRecord) == std::string::npos, "pasted ETX does not create an interrupt send record");
+    TestLocalSubmission(submissionHistory, "\033\x03", "\x03", "Esc does not block sending Ctrl+C to the serial queue");
+    TestLocalSubmission(submissionHistory, "\033\r", "\r", "Esc does not block Enter submission");
+    TestLocalSubmission(submissionHistory, "\033[200~a\033O\033[201~\r", "a\r",
+        "incomplete pasted SS3 leaves Enter able to submit to the serial queue");
     TestSettingsShortcut(true);
     TestSettingsShortcut(false);
     TestEchoDisplay(true, false, false);
