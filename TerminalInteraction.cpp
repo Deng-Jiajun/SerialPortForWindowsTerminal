@@ -262,7 +262,7 @@ std::vector<uint8_t> COMMAND_ECHO_FILTER::Feed(const uint8_t *&data, size_t &siz
     return {};
 }
 
-static size_t EncodedCharacterSize(uint8_t byte, UINT codePage)
+size_t EncodedCharacterSize(uint8_t byte, UINT codePage)
 {
     if (codePage != CP_UTF8)
         return IsDBCSLeadByteEx(codePage, byte) ? 2 : 1;
@@ -273,6 +273,47 @@ static size_t EncodedCharacterSize(uint8_t byte, UINT codePage)
     if (byte >= 0xf0 && byte <= 0xf4)
         return 4;
     return 1;
+}
+
+bool OUTPUT_ESCAPE_STATE::Feed(uint8_t byte)
+{
+    Restart = false;
+    if (Phase == PHASE::None)
+    {
+        if (byte != '\033')
+            return false;
+        Phase = PHASE::Escape;
+        return true;
+    }
+    if (byte == 0x18 || byte == 0x1a)
+        Phase = PHASE::None;
+    else if (byte == '\033')
+    {
+        Phase = PHASE::Escape;
+        Restart = true;
+    }
+    else if (Phase == PHASE::Osc || Phase == PHASE::String)
+    {
+        if (Phase == PHASE::Osc && byte == '\a')
+            Phase = PHASE::None;
+    }
+    else if (Phase == PHASE::Escape)
+    {
+        if (byte == '[')
+            Phase = PHASE::Csi;
+        else if (byte == ']')
+            Phase = PHASE::Osc;
+        else if (byte == 'P' || byte == 'X' || byte == '^' || byte == '_')
+            Phase = PHASE::String;
+        else if (byte >= 0x20 && byte <= 0x2f)
+            Phase = PHASE::Intermediate;
+        else if (byte >= 0x30 && byte <= 0x7e)
+            Phase = PHASE::None;
+    }
+    else if ((Phase == PHASE::Csi && byte >= 0x40 && byte <= 0x7e) ||
+             (Phase == PHASE::Intermediate && byte >= 0x30 && byte <= 0x7e))
+        Phase = PHASE::None;
+    return true;
 }
 
 static bool EscapeFinished(const std::string &escape)
@@ -299,11 +340,21 @@ std::vector<uint8_t> RECEIVE_FORMATTER::Feed(const uint8_t *data, size_t size, c
         if (!Escape.empty())
         {
             Escape += static_cast<char>(byte);
-            if (EscapeFinished(Escape) || Escape.size() >= 4096)
+            EscapeState.Feed(byte);
+            if (EscapeState.Restarted())
+            {
+                // 新 ESC 已开始下一条序列，旧前缀不能参与新 SGR 的筛选
+                if (!logMode)
+                    output.insert(output.end(), Escape.begin(), Escape.end() - 1);
+                Escape = "\033";
+                continue;
+            }
+            if (!EscapeState.Active() || Escape.size() >= 4096)
             {
                 if (!logMode || (Escape.size() >= 3 && Escape[1] == '[' && Escape.back() == 'm'))
                     output.insert(output.end(), Escape.begin(), Escape.end());
                 Escape.clear();
+                EscapeState = OUTPUT_ESCAPE_STATE();
             }
             continue;
         }
@@ -332,6 +383,7 @@ std::vector<uint8_t> RECEIVE_FORMATTER::Feed(const uint8_t *data, size_t size, c
         if (Character.empty() && byte == '\033')
         {
             Escape = "\033";
+            EscapeState.Feed(byte);
             continue;
         }
         if (Character.empty() && byte < 32 && byte != '\t')

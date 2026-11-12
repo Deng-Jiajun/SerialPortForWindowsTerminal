@@ -138,6 +138,98 @@ static void TestReceive()
     Check(highlighted == "[t] \033[91mERROR\033[39m\r\n[t] \033[93mWARN\033[39m x", "existing keyword highlighting with timestamps");
 }
 
+static void TestHighlightBoundaries()
+{
+    SERIAL_CONFIG cfg = {};
+    cfg.HighlightRules = {{L"ERROR", HIGHLIGHT_COLOR_RED}, {L"WARN", HIGHLIGHT_COLOR_YELLOW},
+                          {L"error", HIGHLIGHT_COLOR_RED}, {L"warning", HIGHLIGHT_COLOR_YELLOW},
+                          {L"中文", HIGHLIGHT_COLOR_RED}};
+    auto feed = [](HIGHLIGHT_OUTPUT_STATE& state, const std::string& text, bool flush = false) {
+        auto output = BuildHighlightedOutput(state, reinterpret_cast<const uint8_t*>(text.data()), text.size(), flush);
+        return std::string(output.begin(), output.end());
+    };
+    for (UINT codePage : {static_cast<UINT>(CP_UTF8), 936u})
+    {
+        cfg.EncodingFormat = codePage == CP_UTF8 ? 0 : 1;
+        const auto plain = Bytes(L"錯rror 網ARN", codePage);
+        const auto chinese = Bytes(L"中文", codePage);
+        const auto sample = plain + " ERROR " + chinese;
+        const auto expected = plain + " \033[91mERROR\033[39m \033[91m" + chinese + "\033[39m";
+        for (size_t split = 0; split <= sample.size(); ++split)
+        {
+            HIGHLIGHT_OUTPUT_STATE state;
+            ResetHighlightOutputState(state, cfg);
+            auto output = feed(state, sample.substr(0, split));
+            output += feed(state, sample.substr(split));
+            output += feed(state, "", true);
+            Check(output == expected, "UTF-8 and GBK highlighting respects character boundaries at every packet split");
+        }
+        for (size_t split = 0; split <= plain.size(); ++split)
+        {
+            HIGHLIGHT_OUTPUT_STATE state;
+            ResetHighlightOutputState(state, cfg);
+            auto output = feed(state, plain.substr(0, split), true);
+            output += feed(state, plain.substr(split), true);
+            Check(output == plain, "idle flush never highlights a GBK trail byte or splits a complete character");
+        }
+        for (size_t split = 1; split < Bytes(L"錯", codePage).size(); ++split)
+        {
+            HIGHLIGHT_OUTPUT_STATE state;
+            ResetHighlightOutputState(state, cfg);
+            auto character = Bytes(L"錯", codePage);
+            Check(feed(state, character.substr(0, split), true).empty(), "idle flush retains an incomplete encoded character");
+            Check(feed(state, character.substr(split), true) == character, "remaining bytes restore the complete encoded character");
+        }
+    }
+
+    cfg.EncodingFormat = 0;
+    cfg.HighlightRules = {{L"31", HIGHLIGHT_COLOR_RED}, {L"8", HIGHLIGHT_COLOR_RED}, {L"error", HIGHLIGHT_COLOR_RED}};
+    for (const std::string sequence : {"\033[31m", "\033[1 q", "\033#8", "\033(B", "\033]0;31error\a",
+         "\033]0;31error\033\\", "\033P31error\033\\", "\033^31error\033\\", "\033_31error\033\\",
+         "\033X31error\033\\", "\033[31\x18", "\033]31\x1a", "\033[31\033[0m",
+         "\033]0;old\033[0m", "\033Pold\033[0m", "\033_old\033[0m"})
+    {
+        for (size_t split = 0; split <= sequence.size(); ++split)
+        {
+            HIGHLIGHT_OUTPUT_STATE state;
+            ResetHighlightOutputState(state, cfg);
+            auto output = feed(state, sequence.substr(0, split), true);
+            output += feed(state, sequence.substr(split) + "31", true);
+            Check(output == sequence + "\033[91m31\033[39m", "ANSI bytes stay unchanged and following text resumes highlighting");
+        }
+    }
+    HIGHLIGHT_OUTPUT_STATE state;
+    ResetHighlightOutputState(state, cfg);
+    const std::string longOsc = "\033]0;" + std::string(8192, '8') + "\033\\";
+    std::string output;
+    bool bounded = true;
+    for (auto byte : longOsc)
+    {
+        output += feed(state, std::string(1, byte), true);
+        bounded = bounded && state.Pending.empty();
+    }
+    Check(output == longOsc && bounded, "long raw OSC stays byte-exact without accumulating in the text buffer");
+    RECEIVE_FORMATTER formatter;
+    Check(Format(formatter, "\033#8text", "", false, true) == "text", "local formatter consumes a complete general ESC sequence");
+    formatter.Reset();
+    Check(Format(formatter, "\033#8text", "", false, false) == "\033#8text", "raw formatter preserves a general ESC sequence");
+    for (const std::string prefix : {"\033#", "\033]0;old", "\033Pold", "\033_old"})
+    {
+        const auto sample = prefix + "\033[31mtext";
+        for (size_t split = 0; split <= sample.size(); ++split)
+        {
+            formatter.Reset();
+            auto local = Format(formatter, sample.substr(0, split), "", false, true);
+            local += Format(formatter, sample.substr(split), "", false, true);
+            Check(local == "\033[31mtext", "local formatter preserves the new SGR after an interrupted escape sequence");
+            formatter.Reset();
+            auto raw = Format(formatter, sample.substr(0, split), "", false, false);
+            raw += Format(formatter, sample.substr(split), "", false, false);
+            Check(raw == sample, "raw formatter preserves interrupted escape bytes at every packet split");
+        }
+    }
+}
+
 static void TestHistoryAndInput(const std::wstring& path)
 {
     COMMAND_HISTORY history;
@@ -419,6 +511,104 @@ static void TestSettingsShortcut(bool local)
     Check(cfg.EchoMode == (local ? 1u : 0u) && cfg.EncodingFormat == 0, "old Ctrl+A chords do not change settings");
 }
 
+static void TestRawHighlightDisplay(bool timestamps)
+{
+    TEST_BYTE_PIPE outputPipe;
+    boost::asio::io_service io;
+    boost::asio::windows::stream_handle output(io, outputPipe.TakeServer());
+    CONSOLE_WRITE_QUEUE queue(output);
+    SERIAL_CONFIG cfg = {};
+    cfg.Timestamps = timestamps;
+    cfg.HighlightRules = {{L"ERROR", HIGHLIGHT_COLOR_RED}, {L"WARN", HIGHLIGHT_COLOR_YELLOW},
+                          {L"error", HIGHLIGHT_COLOR_RED}, {L"warning", HIGHLIGHT_COLOR_YELLOW}};
+    COMMAND_HISTORY history;
+    LOCAL_LINE_EDITOR editor(history);
+    TERMINAL_DISPLAY display(io, queue, cfg, editor);
+    auto receive = [&](const std::string& text) {
+        display.Receive(reinterpret_cast<const uint8_t*>(text.data()), text.size(), "[first] ");
+    };
+    auto readOutput = [&]() {
+        io.restart();
+        io.run_for(std::chrono::milliseconds(150));
+        DWORD available = 0, read = 0;
+        if (!PeekNamedPipe(outputPipe.Client, nullptr, 0, nullptr, &available, nullptr))
+            throw std::runtime_error("cannot inspect raw highlight output");
+        std::string text(available, '\0');
+        if (available && !ReadFile(outputPipe.Client, &text[0], available, &read, nullptr))
+            throw std::runtime_error("cannot read raw highlight output");
+        text.resize(read);
+        return text;
+    };
+    const std::string stamp = timestamps ? "[first] " : "";
+    receive("w");
+    Check(readOutput() == stamp + "w", "raw first w appears without another serial packet or newline");
+    receive("w");
+    Check(readOutput() == "w", "raw repeated w appears once without repeating its line timestamp");
+    receive("arning\r\n");
+    Check(readOutput() == "arning\r\n", "late keyword suffix does not duplicate an already displayed prefix");
+    receive("wa");
+    Check(readOutput() == stamp + "wa", "raw partial keyword is displayed after input becomes idle");
+    receive("x\r\n");
+    Check(readOutput() == "x\r\n", "raw nonmatching continuation preserves bytes and line state");
+    receive("w");
+    boost::asio::steady_timer nextPacket(io);
+    nextPacket.expires_after(std::chrono::milliseconds(5));
+    nextPacket.async_wait([&](const boost::system::error_code& ec) {
+        if (!ec) receive("arning\r\n");
+    });
+    Check(readOutput() == stamp + "\033[93mwarning\033[39m\r\n",
+        "raw keyword highlighting still matches across nearby serial packets");
+
+    for (const auto& rule : cfg.HighlightRules)
+    {
+        auto keyword = Bytes(rule.Keyword);
+        for (size_t length = 1; length < keyword.size(); ++length)
+        {
+            auto prefix = keyword.substr(0, length);
+            receive(prefix);
+            Check(readOutput() == stamp + prefix, "every configured raw keyword prefix appears after idle timeout");
+            receive("\r\n");
+            Check(readOutput() == "\r\n", "flushed keyword prefix is not repeated on the next line ending");
+        }
+    }
+
+    receive("w");
+    io.post([&]() {
+        receive("arning\r\nw");
+        nextPacket.expires_after(std::chrono::milliseconds(5));
+        nextPacket.async_wait([&](const boost::system::error_code& ec) {
+            if (!ec) receive("arning\r\n");
+        });
+    });
+    // Windows I/O 循环先将到期回调排到已有处理器后面，再由该处理器为新前缀重设计时
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    const auto highlightedLine = stamp + "\033[93mwarning\033[39m\r\n";
+    Check(readOutput() == highlightedLine + highlightedLine,
+        "an already queued timer completion cannot flush a newly buffered keyword prefix");
+
+    receive("w");
+    display.Message("notice");
+    auto messageOutput = readOutput();
+    Check(messageOutput.find(stamp + "w\r\n") == 0 &&
+        messageOutput.find("notice\r\n") == messageOutput.size() - 8 &&
+        std::count(messageOutput.begin(), messageOutput.end(), 'w') == 1,
+        "a message follows the pending raw prefix without later duplicate timer output");
+
+    receive("w");
+    auto next = cfg;
+    next.Timestamps = !timestamps;
+    display.Configure(next);
+    Check(readOutput() == stamp + "w", "settings flush a pending raw prefix exactly once using the old format");
+    receive("xyz\r\n");
+    Check(readOutput() == (timestamps ? "xyz\r\n" : "[first] xyz\r\n"),
+        "raw reception uses the new format after settings cancel the old highlight timer");
+
+    receive("w");
+    display.Stop();
+    Check(readOutput() == (timestamps ? "w" : "[first] w"), "stopping flushes a pending raw prefix exactly once");
+    Check(readOutput().empty(), "cancelled highlight timer emits nothing after the display has stopped");
+}
+
 static void TestEchoDisplay(bool local, bool external, bool timeout)
 {
     TEST_BYTE_PIPE outputPipe;
@@ -455,6 +645,79 @@ static void TestEchoDisplay(bool local, bool external, bool timeout)
           "echo display filtering applies only to timely local manual input");
     Check(text.find("[later] /\r\n[later] pwd\r\n[later] / # ") != std::string::npos,
           "result later equal line prompt and receive timestamps are retained");
+}
+
+static void TestQueuedEchoTimer()
+{
+    TEST_BYTE_PIPE outputPipe;
+    boost::asio::io_service io;
+    boost::asio::windows::stream_handle output(io, outputPipe.TakeServer());
+    CONSOLE_WRITE_QUEUE queue(output);
+    SERIAL_CONFIG cfg = {};
+    cfg.EchoMode = 1;
+    COMMAND_HISTORY history;
+    LOCAL_LINE_EDITOR editor(history);
+    TERMINAL_DISPLAY display(io, queue, cfg, editor);
+    boost::asio::steady_timer nextPacket(io);
+    display.Sent({'o', 'l', 'd'}, false);
+    io.post([&]() {
+        display.Sent({'n', 'e', 'w'}, false);
+        display.Receive(reinterpret_cast<const uint8_t*>("n"), 1, "");
+        nextPacket.expires_after(std::chrono::milliseconds(5));
+        nextPacket.async_wait([&](const boost::system::error_code& ec) {
+            if (!ec)
+            {
+                const std::string reply = "ew\r\nresult\r\n";
+                display.Receive(reinterpret_cast<const uint8_t*>(reply.data()), reply.size(), "");
+            }
+        });
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    io.run_for(std::chrono::milliseconds(150));
+    DWORD available = 0, read = 0;
+    if (!PeekNamedPipe(outputPipe.Client, nullptr, 0, nullptr, &available, nullptr))
+        throw std::runtime_error("cannot inspect queued echo timer output");
+    std::string text(available, '\0');
+    if (available) ReadFile(outputPipe.Client, &text[0], available, &read, nullptr);
+    text.resize(read);
+    Check(text == "\r\n\033[96m> old\033[39m\r\n\r\n\033[96m> new\033[39m\r\nresult\r\n",
+        "an old queued echo timeout cannot cancel the new command echo filter");
+}
+
+static void TestLocalHighlightDisplay()
+{
+    auto previousOutput = GetStdHandle(STD_OUTPUT_HANDLE);
+    auto screen = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                            nullptr, CONSOLE_TEXTMODE_BUFFER, nullptr);
+    if (screen == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("cannot create an inactive console buffer for local display testing");
+    SetStdHandle(STD_OUTPUT_HANDLE, screen);
+    TEST_BYTE_PIPE outputPipe;
+    boost::asio::io_service io;
+    boost::asio::windows::stream_handle output(io, outputPipe.TakeServer());
+    CONSOLE_WRITE_QUEUE queue(output);
+    SERIAL_CONFIG cfg = {};
+    cfg.EchoMode = 1;
+    cfg.HighlightRules = {{L"error", HIGHLIGHT_COLOR_RED}};
+    COMMAND_HISTORY history;
+    LOCAL_LINE_EDITOR editor(history);
+    Type(editor, "draft");
+    TERMINAL_DISPLAY display(io, queue, cfg, editor);
+    display.ApplyMode();
+    SetStdHandle(STD_OUTPUT_HANDLE, previousOutput);
+    CloseHandle(screen);
+    display.Receive(reinterpret_cast<const uint8_t*>("power"), 5, "");
+    io.run_for(std::chrono::milliseconds(150));
+    DWORD available = 0, read = 0;
+    if (!PeekNamedPipe(outputPipe.Client, nullptr, 0, nullptr, &available, nullptr))
+        throw std::runtime_error("cannot inspect local highlight output");
+    std::string text(available, '\0');
+    if (available) ReadFile(outputPipe.Client, &text[0], available, &read, nullptr);
+    text.resize(read);
+    Check(!display.IsStopped() && text.find("\x1b" "8pow\x1b" "7") != std::string::npos &&
+        text.find("\x1b" "8er\x1b" "7") != std::string::npos && editor.Text() == L"draft",
+        "local log suffix appears after idle timeout while the footer draft is preserved");
+    display.Cancel();
 }
 
 static void TestErrorEncoding()
@@ -784,6 +1047,7 @@ int wmain(int argc, const wchar_t* argv[])
     }
     TestEchoFilter();
     TestReceive();
+    TestHighlightBoundaries();
     TestHistoryAndInput(argv[1]);
     TestEscapeInput(std::wstring(argv[1]) + L".escape");
     auto submissionHistory = std::wstring(argv[1]) + L".submission";
@@ -835,10 +1099,14 @@ int wmain(int argc, const wchar_t* argv[])
         "incomplete pasted SS3 leaves Enter able to submit to the serial queue");
     TestSettingsShortcut(true);
     TestSettingsShortcut(false);
+    TestRawHighlightDisplay(false);
+    TestRawHighlightDisplay(true);
     TestEchoDisplay(true, false, false);
     TestEchoDisplay(false, false, false);
     TestEchoDisplay(true, true, false);
     TestEchoDisplay(true, false, true);
+    TestQueuedEchoTimer();
+    TestLocalHighlightDisplay();
     TestErrorEncoding();
     TestSerialTermination(false, false);
     TestSerialTermination(true, false);

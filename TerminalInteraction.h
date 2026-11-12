@@ -8,6 +8,21 @@
 std::string LocalTimestamp();
 std::vector<uint8_t> EncodeTerminalText(const std::wstring &text, UINT codePage);
 DWORD CommandHistoryPath(std::wstring &path);
+size_t EncodedCharacterSize(uint8_t byte, UINT codePage);
+
+// 输出控制序列只跟踪边界，内容由调用方原样保留；输入快捷键使用自己的解析规则
+class OUTPUT_ESCAPE_STATE
+{
+  public:
+    bool Feed(uint8_t byte);
+    bool Active() const { return Phase != PHASE::None; }
+    bool Restarted() const { return Restart; }
+
+  private:
+    enum class PHASE { None, Escape, Intermediate, Csi, Osc, String };
+    PHASE Phase = PHASE::None;
+    bool Restart = false;
+};
 
 class COMMAND_HISTORY
 {
@@ -58,6 +73,7 @@ class RECEIVE_FORMATTER
     bool PreviousCR = false;
     std::string LineTime;
     std::string Escape;
+    OUTPUT_ESCAPE_STATE EscapeState;
     std::string Character;
     size_t CharacterSize = 0;
 };

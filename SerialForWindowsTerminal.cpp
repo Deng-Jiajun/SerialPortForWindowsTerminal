@@ -421,6 +421,7 @@ typedef struct
 {
     std::vector<ENCODED_HIGHLIGHT_RULE> Rules;
     std::vector<uint8_t> Pending;
+    OUTPUT_ESCAPE_STATE Escape;
     DWORD EncodingFormat;
 }HIGHLIGHT_OUTPUT_STATE;
 
@@ -473,12 +474,14 @@ static void ResetHighlightOutputState(HIGHLIGHT_OUTPUT_STATE& state, const SERIA
 {
     state.Rules.clear();
     state.Pending.clear();
+    state.Escape = OUTPUT_ESCAPE_STATE();
     state.EncodingFormat = cfg.EncodingFormat;
     auto codePage = cfg.EncodingFormat == 0 ? CP_UTF8 : 936;
     for (const auto& rule : cfg.HighlightRules)
     {
         auto keyword = EncodeHighlightKeyword(rule.Keyword, codePage);
-        if (keyword.empty() || rule.Color >= HIGHLIGHT_COLOR_COUNT)
+        if (keyword.empty() || rule.Color >= HIGHLIGHT_COLOR_COUNT ||
+            std::any_of(keyword.begin(), keyword.end(), [](uint8_t byte) { return byte < 32 || byte == 127; }))
         {
             continue;
         }
@@ -527,7 +530,18 @@ static std::vector<uint8_t> BuildHighlightedOutput(
     size_t position = 0;
     while (position < state.Pending.size())
     {
+        auto byte = state.Pending[position];
+        // 控制序列直接推进，只保存解析状态，避免长 OSC/DCS 在高亮缓冲中累积
+        if (state.Escape.Feed(byte) || byte < 32 || byte == 127)
+        {
+            output.push_back(byte);
+            ++position;
+            continue;
+        }
         auto remainingSize = state.Pending.size() - position;
+        auto characterSize = EncodedCharacterSize(byte, state.EncodingFormat == 0 ? CP_UTF8 : 936);
+        if (remainingSize < characterSize)
+            break;
         if (!flush)
         {
             auto isKeywordPrefix = std::any_of(
@@ -557,8 +571,9 @@ static std::vector<uint8_t> BuildHighlightedOutput(
 
         if (matchedRule == nullptr)
         {
-            output.push_back(state.Pending[position]);
-            ++position;
+            output.insert(output.end(), state.Pending.begin() + position,
+                          state.Pending.begin() + position + characterSize);
+            position += characterSize;
             continue;
         }
 
@@ -705,7 +720,8 @@ class TERMINAL_DISPLAY
   public:
     TERMINAL_DISPLAY(boost::asio::io_service &ioctx, CONSOLE_WRITE_QUEUE &queue, SERIAL_CONFIG &config,
                      LOCAL_LINE_EDITOR &editor)
-        : IoContext(ioctx), Queue(queue), Config(config), Editor(editor), ResizeTimer(ioctx), EchoTimer(ioctx)
+        : IoContext(ioctx), Queue(queue), Config(config), Editor(editor), ResizeTimer(ioctx), EchoTimer(ioctx),
+          HighlightTimer(ioctx)
     {
         ResetHighlightOutputState(Highlight, config);
     }
@@ -729,6 +745,8 @@ class TERMINAL_DISPLAY
     void Configure(SERIAL_CONFIG next)
     {
         FlushEcho();
+        boost::system::error_code ignored;
+        HighlightTimer.cancel(ignored);
         auto pending = Formatter.Flush();
         auto output = BuildHighlightedOutput(Highlight, pending.data(), pending.size(), true);
         Write(std::move(output));
@@ -788,8 +806,9 @@ class TERMINAL_DISPLAY
             Echo.Expect(command);
             // 接收内容没有回显标记；只在发送后短时间内尝试完整匹配
             EchoTimer.expires_after(std::chrono::seconds(1));
-            EchoTimer.async_wait([this](const boost::system::error_code &ec) {
-                if (!ec)
+            auto expiresAt = EchoTimer.expiry();
+            EchoTimer.async_wait([this, expiresAt](const boost::system::error_code &ec) {
+                if (!ec && !Stopped && EchoTimer.expiry() == expiresAt)
                     FlushEcho();
             });
         }
@@ -817,6 +836,7 @@ class TERMINAL_DISPLAY
         boost::system::error_code ignored;
         ResizeTimer.cancel(ignored);
         EchoTimer.cancel(ignored);
+        HighlightTimer.cancel(ignored);
     }
 
     void Stop(const boost::system::error_code& error = {})
@@ -845,6 +865,20 @@ class TERMINAL_DISPLAY
         else
             bytes.assign(data, data + size);
         Write(BuildHighlightedOutput(Highlight, bytes.data(), bytes.size(), false));
+        boost::system::error_code ignored;
+        HighlightTimer.cancel(ignored);
+        if (!Highlight.Pending.empty() &&
+            Highlight.Pending.size() >= EncodedCharacterSize(Highlight.Pending.front(), CodePage()))
+        {
+            // 两种模式都在短暂等待分包后显示完整文本，半个编码字符继续等后续字节
+            HighlightTimer.expires_after(std::chrono::milliseconds(50));
+            auto expiresAt = HighlightTimer.expiry();
+            HighlightTimer.async_wait([this, expiresAt](const boost::system::error_code &ec) {
+                // 已排队的成功回调无法取消，重设计时后只处理当前这次等待
+                if (!ec && !Stopped && HighlightTimer.expiry() == expiresAt)
+                    Write(BuildHighlightedOutput(Highlight, nullptr, 0, true));
+            });
+        }
     }
 
     void FlushEcho()
@@ -926,6 +960,7 @@ class TERMINAL_DISPLAY
     LOCAL_LINE_EDITOR &Editor;
     boost::asio::steady_timer ResizeTimer;
     boost::asio::steady_timer EchoTimer;
+    boost::asio::steady_timer HighlightTimer;
     HIGHLIGHT_OUTPUT_STATE Highlight;
     RECEIVE_FORMATTER Formatter;
     COMMAND_ECHO_FILTER Echo;
@@ -1795,6 +1830,8 @@ int wmain(int argc, const WCHAR* args[])
             {
                 std::cerr << "\033[31m" << "can not initialize " << portName << "\033[0m" << std::endl;
                 std::cerr << "\033[31m" << "error : " << ErrorMessage(ec, GetConsoleOutputCP()) << "\033[0m" << std::endl;
+                boost::system::error_code closeError;
+                serialPort.close(closeError);
                 continue;
             }
             else
